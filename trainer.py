@@ -9,10 +9,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+from contextlib import nullcontext
 from tensorboardX import SummaryWriter
 from torch.nn.modules.loss import CrossEntropyLoss, CosineEmbeddingLoss
 from torch.utils.data import DataLoader
-import torch.nn.functional as F
 from tqdm import tqdm
 from utils import DiceLoss, Focal_loss
 from torchvision import transforms
@@ -26,6 +29,8 @@ from batchgenerators.transforms.channel_selection_transforms import DataChannelS
 from batchgenerators.transforms.color_transforms import GammaTransform
 from batchgenerators.transforms.spatial_transforms import SpatialTransform, MirrorTransform
 from batchgenerators.transforms.utility_transforms import RemoveLabelTransform, RenameTransform, NumpyToTensor
+
+from opt_utils import vanilla_opt, train_with_grpo
 
 def torch2D_Hausdorff_distance(x,y): # Input be like (Batch,width,height)
     x = x.float()
@@ -110,10 +115,10 @@ class AddPepperNoise(object):
 
 def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
-    logging.basicConfig(filename=snapshot_path + "/log.txt", level=logging.INFO,
+    logging.basicConfig(filename=snapshot_path + "/log.txt", level=tqdm.write,
                         format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
-    logging.info(str(args))
+    tqdm.write(str(args))
     base_lr = args.base_lr
     num_classes = args.num_classes
     batch_size = args.batch_size * args.n_gpu
@@ -127,45 +132,72 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
     def worker_init_fn(worker_id):
         random.seed(args.seed + worker_id)
 
-    trainloader = DataLoader(db_train, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True,
+    trainloader = DataLoader(db_train, batch_size=batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True,
                              worker_init_fn=worker_init_fn)
-    if args.n_gpu > 1:
-        model = nn.DataParallel(model)
-        # model = model.module
-    model.train()
-    
-    model_total_params = sum(p.numel() for p in model.parameters())
-    model_grad_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('model_grad_params:' + str(model_grad_params), '\nmodel_total_params:' + str(model_total_params))
+    if args.model == 'hsam':
+        if args.n_gpu > 1:
+            model = nn.DataParallel(model)
+            # model = model.module
+        model.train()
+        
+        model_total_params = sum(p.numel() for p in model.parameters())
+        model_grad_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print('model_grad_params:' + str(model_grad_params), '\nmodel_total_params:' + str(model_total_params))
 
-    ce_loss = CrossEntropyLoss()
-    cos_loss = CosineEmbeddingLoss()
-    l1_loss = nn.L1Loss()
-    dice_loss = DiceLoss(num_classes + 1)
-    # dice_loss = Focal_loss(num_classes=num_classes + 1)
-    if args.warmup:
-        b_lr = base_lr / args.warmup_period
-    else:
-        b_lr = base_lr
-    if args.AdamW:
-        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=b_lr, betas=(0.9, 0.999), weight_decay=0.1)
-    else:
-        optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=b_lr, momentum=0.9, weight_decay=0.0001)  # Even pass the model.parameters(), the `requires_grad=False` layers will not update
+        ce_loss = CrossEntropyLoss()
+        cos_loss = CosineEmbeddingLoss()
+        l1_loss = nn.L1Loss()
+        dice_loss = DiceLoss(num_classes + 1)
+        # dice_loss = Focal_loss(num_classes=num_classes + 1)
+        if args.warmup:
+            b_lr = base_lr / args.warmup_period
+        else:
+            b_lr = base_lr
+        if args.AdamW:
+            optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=b_lr, betas=(0.9, 0.999), weight_decay=0.1)
+        else:
+            optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=b_lr, momentum=0.9, weight_decay=0.0001)  # Even pass the model.parameters(), the `requires_grad=False` layers will not update
+    
+    elif args.model == 'sam2':
+        if args.n_gpu > 1:
+            model.model = nn.DataParallel(model.model)
+            # model = model.module
+        model.model.train()
+        
+        model_total_params = sum(p.numel() for p in model.model.parameters())
+        model_grad_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+        print('model_grad_params:' + str(model_grad_params), '\nmodel_total_params:' + str(model_total_params))
+
+        ce_loss = CrossEntropyLoss()
+        dice_loss = DiceLoss(num_classes + 1)
+        # dice_loss = Focal_loss(num_classes=num_classes + 1)
+        if args.warmup:
+            b_lr = base_lr / args.warmup_period
+        else:
+            b_lr = base_lr
+        if args.AdamW:
+            optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.model.parameters()), lr=b_lr, betas=(0.9, 0.999), weight_decay=args.weight_decay, eps=1e-5)
+        else:
+            optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.model.parameters()), lr=b_lr, momentum=0.9, weight_decay=args.weight_decay*0.001)  # Even pass the model.parameters(), the `requires_grad=False` layers will not update
+    else: raise ValueError
+
     writer = SummaryWriter(snapshot_path + '/log')
     iter_num = 0
     max_epoch = args.max_epochs
     stop_epoch = args.stop_epoch
     max_iterations = args.max_epochs * len(trainloader)  # max_epoch = max_iterations // len(trainloader) + 1
-    logging.info("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
+    tqdm.write("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
     best_performance = 0.0
     iterator = tqdm(range(max_epoch), ncols=70)
     for epoch_num in iterator:
-        for i_batch, sampled_batch in enumerate(trainloader):
+        for i_batch, sampled_batch in tqdm(enumerate(trainloader)):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']  # [b, c, h, w], [b, h, w]
             low_res_label_batch = sampled_batch['low_res_label']
             image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
             low_res_label_batch = low_res_label_batch.cuda()
             assert image_batch.max() <= 3, f'image_batch max: {image_batch.max()}'
+
+            if args.model == "sam2" and label_batch.max() == 0: continue
 
             image_transform = image_batch.cpu()
             trans = transforms.Compose([
@@ -175,21 +207,36 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                 transforms.ToTensor(),
                 ])
             img_list = []
+            num_prompts_per_class = 3
             for i in range(image_transform.shape[0]):
                 img = image_transform[i]
                 img = trans(img)
                 img_list.append(img)
             image_transform = torch.stack(img_list,dim=0).cuda()
-            outputs1,outputs2, attn1, attn2 = model(image_batch, multimask_output, args.img_size, gt=low_res_label_batch)
-            loss1, loss_ce1, loss_dice1 = calc_loss(outputs1, low_res_label_batch, ce_loss, dice_loss, dice_weight=args.dice_param)
-            loss2, loss_ce2, loss_dice2 = calc_loss(outputs2, label_batch, ce_loss, dice_loss, dice_weight=args.dice_param)
-            weight = 0.6**(0.990**epoch_num)
-            weight_self = 0.2
-            loss = (1-weight)*loss1 + (weight)*loss2
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if args.model == 'hsam':
+                outputs1,outputs2, attn1, attn2 = model(image_batch, multimask_output, args.img_size, gt=low_res_label_batch)
+                loss1, loss_ce1, loss_dice1 = calc_loss(outputs1, low_res_label_batch, ce_loss, dice_loss, dice_weight=args.dice_param)
+                loss2, loss_ce2, loss_dice2 = calc_loss(outputs2, label_batch, ce_loss, dice_loss, dice_weight=args.dice_param)
+                weight = 0.6**(0.990**epoch_num)
+                weight_self = 0.2
+                loss = (1-weight)*loss1 + (weight)*loss2
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            elif args.model == 'sam2':
+                dtype = None if args.precision == 'float32' else getattr(torch, args.precision) # 设置精度和上下文
+                amp_context = nullcontext() if dtype is None else torch.autocast(device_type="cuda", dtype=dtype)
+                scaler = torch.amp.GradScaler() if args.precision == 'float16' else None    # # 只有float16需要梯度缩放
+
+                with amp_context:  # torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16)
+                    # 对于不同的 prompt 导致的不同的预测结果, 计算出奖励, 然后使用 GRPO 进行优化: 奖励是由其他模型提供的, 那么怎么对本模型进行优化呢？
+                    # 奖励的方式: 训练一个 prompt奖励回归器、基于 iou_prediction、基于预测结果跟 ground truth 的 iou、基于更大的模型
+                    if args.is_po:
+                        loss, avg_reward = train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class,
+                                                        iteration=iter_num, writer=writer)
+                    else:
+                        loss, _ = vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class)
+
             if args.warmup and iter_num < args.warmup_period:
                 lr_ = base_lr * ((iter_num + 1) / args.warmup_period)
                 for param_group in optimizer.param_groups:
@@ -207,32 +254,50 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             iter_num = iter_num + 1
             writer.add_scalar('info/lr', lr_, iter_num)
             writer.add_scalar('info/total_loss', loss, iter_num)
-            writer.add_scalar('info/loss_ce1', loss_ce1, iter_num)
-            writer.add_scalar('info/loss_dice1', loss_dice1, iter_num)
-            writer.add_scalar('info/loss_ce2', loss_ce2, iter_num)
-            writer.add_scalar('info/loss_dice2', loss_dice2, iter_num)
+            if args.model == 'hsam':
+                writer.add_scalar('info/loss_ce1', loss_ce1, iter_num)
+                writer.add_scalar('info/loss_dice1', loss_dice1, iter_num)
+                writer.add_scalar('info/loss_ce2', loss_ce2, iter_num)
+                writer.add_scalar('info/loss_dice2', loss_dice2, iter_num)
+            elif args.model == 'sam2' and args.is_po:
+                writer.add_scalar('info/avg_reward', avg_reward, iter_num)
+            else: raise ValueError
             # writer.add_scalar('info/loss_self2', loss_self, iter_num)
 
-            # logging.info('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item()))
-            logging.info('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f, loss_ce2: %f, loss_dice2: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item(), loss_ce2.item(), loss_dice2.item()))
+            # tqdm.write('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item()))
+            if args.model == 'hsam':
+                tqdm.write('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f, loss_ce2: %f, loss_dice2: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item(), loss_ce2.item(), loss_dice2.item()))
+            else:
+                tqdm.write('iteration %d : loss : %f' % (iter_num, loss))
 
-
-        save_interval = 50 # int(max_epoch/6)
+        save_interval = args.interval_epoch # int(max_epoch/6) Todo: 增加参数
         if (epoch_num + 1) % save_interval == 0:
             save_mode_path = os.path.join(snapshot_path, 'epoch_' + str(epoch_num) + '.pth')
-            try:
-                model.save_lora_parameters(save_mode_path)
-            except:
-                model.module.save_lora_parameters(save_mode_path)
-            logging.info("save model to {}".format(save_mode_path))
+            if args.model == 'hsam':
+                try:
+                    model.save_lora_parameters(save_mode_path)
+                except:
+                    model.module.save_lora_parameters(save_mode_path)
+            elif args.model == 'sam2':
+                try:
+                    torch.save(model.model.state_dict(), save_mode_path)
+                except:
+                    torch.save(model.model.module.state_dict(), save_mode_path)
+            tqdm.write("save model to {}".format(save_mode_path))
 
         if epoch_num >= max_epoch - 1 or epoch_num >= stop_epoch - 1:
             save_mode_path = os.path.join(snapshot_path, 'epoch_' + str(epoch_num) + '.pth')
-            try:
-                model.save_lora_parameters(save_mode_path)
-            except:
-                model.module.save_lora_parameters(save_mode_path)
-            logging.info("save model to {}".format(save_mode_path))
+            if args.model == 'hsam':
+                try:
+                    model.save_lora_parameters(save_mode_path)
+                except:
+                    model.module.save_lora_parameters(save_mode_path)
+            elif args.model == 'sam2':
+                try:
+                    torch.save(model.model.state_dict(), save_mode_path)
+                except:
+                    torch.save(model.model.module.state_dict(), save_mode_path)
+            tqdm.write("save model to {}".format(save_mode_path))
             iterator.close()
             break
 

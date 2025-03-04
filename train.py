@@ -1,11 +1,16 @@
 import argparse
 import logging
 import os
+import pytz
+import datetime
+# 设置该文件所在文件夹为工作目录
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 import random
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 
+from PIL import Image
 from importlib import import_module
 
 from sam_lora_image_encoder import LoRA_Sam
@@ -39,6 +44,7 @@ parser.add_argument('--deterministic', type=int, default=1,
                     help='whether use deterministic training')
 parser.add_argument('--base_lr', type=float, default=0.005,
                     help='segmentation network learning rate')
+parser.add_argument('--weight_decay', type=float, default=0.1)
 parser.add_argument('--img_size', type=int,
                     default=224, help='input patch size of network input')
 parser.add_argument('--seed', type=int,
@@ -46,8 +52,8 @@ parser.add_argument('--seed', type=int,
 parser.add_argument('--vit_name', type=str,
                     default='vit_b', help='select one vit model')
 parser.add_argument('--ckpt', type=str, default='checkpoints/sam_vit_b_01ec64.pth',
-                    help='Pretrained checkpoint')
-parser.add_argument('--lora_ckpt', type=str, default=None, help='Finetuned lora checkpoint')
+                    help='Pretrained checkpoint; 只对于 hsam 有效')
+parser.add_argument('--lora_ckpt', type=str, default=None, help='Finetuned lora checkpoint; 只对 hsam 有效')
 parser.add_argument('--rank', type=int, default=5, help='Rank for LoRA adaptation')
 parser.add_argument('--warmup', action='store_true', help='If activated, warp up the learning from a lower lr to the base_lr')
 parser.add_argument('--warmup_period', type=int, default=250,
@@ -55,7 +61,39 @@ parser.add_argument('--warmup_period', type=int, default=250,
 parser.add_argument('--AdamW', action='store_true', help='If activated, use AdamW to finetune SAM model')
 parser.add_argument('--module', type=str, default='sam_lora_image_encoder')
 parser.add_argument('--dice_param', type=float, default=0.9)
+
+parser.add_argument('--debug', '-d', action='store_true', help='If activated, debug mode is activated')
+parser.add_argument('--num_workers', type=int, default=8, help='number of workers')
+parser.add_argument('--interval_epoch', type=int, default=50, help='interval epoch for saving')
+
+parser.add_argument('--model', type=str, default='sam2', choices=['hsam', 'sam2'], help='模型选择')
+parser.add_argument('--is_po', action='store_true', help='是否使用XPO优化')
+# parser.add_argument('--mixed_precision', type=str, default='no', choices=['no', 'fp16', 'bf16'], help='混合精度训练类型: no=禁用, fp16=float16, bf16=bfloat16')
+parser.add_argument('--precision', type=str, default='float32', choices=['float32', 'float16', 'bfloat16'], help='训练精度: float32=全精度, float16=半精度, bfloat16=BF16精度')
+
 args = parser.parse_args()
+
+if args.debug:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+    args.n_gpu = int(torch.cuda.device_count())
+    if args.model == 'sam2':
+        args.root_path = '/new_wyh/Synapse-multi-organ-CT-dataset/train_npz_new_224_with_foreground/'
+    elif args.model == 'hsam':
+        args.root_path = '/new_wyh/Synapse-multi-organ-CT-dataset/train_npz_new_224/'
+    args.split = 'train'
+    args.batch_size = 2
+    args.base_lr = 0.0026
+    args.img_size = 224
+    args.warmup = True
+    args.AdamW = True
+    args.max_epochs = 300
+    args.stop_epoch = 300
+    args.vit_name = 'vit_b'
+    args.num_workers = 0
+    args.ckpt = 'checkpoints/sam_vit_b_01ec64.pth'
+
+    args.interval_epoch = 2
+
 
 if __name__ == "__main__":
     if not args.deterministic:
@@ -79,7 +117,9 @@ if __name__ == "__main__":
     }
     args.is_pretrain = True
     args.exp = dataset_name + '_' + str(args.img_size)
-    snapshot_path = os.path.join(args.output, "{}".format(args.exp))
+    tz = pytz.timezone('Asia/Shanghai')  # 东八区对应的时区
+    current_time = datetime.datetime.now(tz).strftime("%Y%m%d_%H%M%S")
+    snapshot_path = os.path.join(args.output, args.model, "{}_{}".format(current_time, args.exp))
     snapshot_path = snapshot_path + '_pretrain' if args.is_pretrain else snapshot_path
     snapshot_path += '_' + args.vit_name
     snapshot_path = snapshot_path + '_' + str(args.max_iterations)[
@@ -93,17 +133,37 @@ if __name__ == "__main__":
         os.makedirs(snapshot_path)
 
     # register model
-    sam, img_embedding_size = sam_model_registry[args.vit_name](image_size=args.img_size,
-                                                                num_classes=args.num_classes,
-                                                                checkpoint=args.ckpt, pixel_mean=[0, 0, 0],
-                                                                pixel_std=[1, 1, 1])
+    if args.model == 'hsam':
+        sam, img_embedding_size = sam_model_registry[args.vit_name](image_size=args.img_size,
+                                                                    num_classes=args.num_classes,
+                                                                    checkpoint=args.ckpt, pixel_mean=[0, 0, 0],
+                                                                    pixel_std=[1, 1, 1])
 
-    pkg = import_module(args.module)
-    net = pkg.LoRA_Sam(sam, args.rank).cuda()
+        pkg = import_module(args.module)
+        net = pkg.LoRA_Sam(sam, args.rank).cuda()
 
-    # net = LoRA_Sam(sam, args.rank).cuda()
-    if args.lora_ckpt is not None:
-        net.load_lora_parameters(args.lora_ckpt)
+        # net = LoRA_Sam(sam, args.rank).cuda()
+        if args.lora_ckpt is not None:
+            net.load_lora_parameters(args.lora_ckpt)
+    
+    elif args.model == 'sam2':
+        # 需要进入sam2-main文件夹下, 然后 pip install -e .; 或者按照官网的教程安装
+        # 使用: /database/wuyonghuang/hsam_code/sam2-main/test.ipynb
+        from sam2.build_sam import build_sam2
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+        if args.vit_name == 'vit_b':
+            checkpoint = "/database/wuyonghuang/hsam_code/sam2-main/checkpoints/sam2.1_hiera_base_plus.pt"
+            model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"    # 这个是安装的时候写的, 不是相对路径
+        elif args.vit_name == 'vit_l':
+            checkpoint = "/database/wuyonghuang/hsam_code/sam2-main/checkpoints/sam2.1_hiera_large.pt"
+            model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        else: raise ValueError
+        sam2 = build_sam2(model_cfg, checkpoint)
+        net = SAM2ImagePredictor(sam2)
+
+        # 沿用 hsam 的设置
+        img_embedding_size = 14
 
     if args.num_classes > 1:
         multimask_output = True
