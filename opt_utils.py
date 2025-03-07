@@ -1,4 +1,6 @@
+import os
 import torch 
+import torch.nn.functional as F
 from torch import nn
 from einops import rearrange
 from gen_prompt import generate_prompts_from_semantic_mask, get_prompt_preds, concatenate_masks_and_scores_v2, plot_results
@@ -25,7 +27,7 @@ def vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_
         )
 
         decoded_mask = prompts['decoded_mask']
-        # 按照decoded_mask的键的顺序进行排序，然后将值重复三次再全部拼接起来。
+        # 按照decoded_mask的键的顺序进行排序, 然后将值重复三次再全部拼接起来。
         exist_keys = sorted(decoded_mask.keys())
         for key in exist_keys:
             # decoded_mask[key] = np.repeat(decoded_mask[key], 3, axis=0)
@@ -93,7 +95,10 @@ def normalize_in_chunks(x, chunk_size):
 
 # 2. 实现奖励函数计算
 def compute_segmentation_rewards(pred_masks, gt_masks, images):
-    """计算分割质量奖励"""
+    """计算分割质量奖励
+        # rewards = compute_segmentation_rewards(resized_masks, decoded_mask, torch.from_numpy(image).permute(2, 0, 1).cuda()\
+        #                                         if len(image.shape) == 3 else torch.from_numpy(image).cuda())
+    """
     rewards = []
     
     for pred, gt, img in zip(pred_masks, gt_masks, images):
@@ -117,12 +122,14 @@ def compute_segmentation_rewards(pred_masks, gt_masks, images):
     
     return rewards
 
+
 def compute_iou(pred, gt):
     """计算IoU分数"""
     pred_binary = (torch.sigmoid(pred) > 0.5).float()
     intersection = (pred_binary * gt).sum()
     union = pred_binary.sum() + gt.sum() - intersection
     return (intersection / (union + 1e-8)).item()
+
 
 def compute_edge_smoothness(pred, img):
     """计算边缘平滑度分数"""
@@ -143,6 +150,7 @@ def compute_edge_smoothness(pred, img):
     alignment = (pred_edges.squeeze() * img_grad).sum() / (pred_edges.sum() + 1e-8)
     return alignment.item()
 
+
 def compute_connectivity_score(pred):
     """计算区域连通性分数"""
     # 使用简化的连通性度量 - 实际应用中可使用scipy的label函数
@@ -156,10 +164,11 @@ def compute_connectivity_score(pred):
     connectivity = (eroded.sum() / (dilated.sum() + 1e-8)).item()
     return connectivity
 
+
 # 3. 实现获取模型预测概率的函数
 def get_mask_log_probs(model, image, prompts, pred_masks=None):
     """获取模型对掩码的预测对数概率"""
-    # 已设置图像的情况下，直接使用prompts获取logits
+    # 已设置图像的情况下, 直接使用prompts获取logits
     results = get_prompt_preds(
         model, prompts, prompt_mode='point', 
         multimask_output=True, 
@@ -172,9 +181,9 @@ def get_mask_log_probs(model, image, prompts, pred_masks=None):
     # all_logits = results.get('logits', None)
     all_logits, all_scores, category_indices = concatenate_masks_and_scores_v2(results['prompts_preds'], sort_keys=True)
     if all_logits is None:
-        raise ValueError("模型预测未返回logits，请确保get_prompt_preds函数支持return_logits参数")
+        raise ValueError("模型预测未返回logits, 请确保get_prompt_preds函数支持return_logits参数")
     
-    # 如果提供了pred_masks，计算这些掩码的对数概率
+    # 如果提供了pred_masks, 计算这些掩码的对数概率
     if pred_masks is not None:
         batch_log_probs = []
         for logits, mask in zip(all_logits, pred_masks):
@@ -193,6 +202,30 @@ def get_mask_log_probs(model, image, prompts, pred_masks=None):
         return torch.stack(batch_log_probs)
     
     return all_logits
+
+
+def continuous_to_dispersed(tensor_2d):
+    """
+    处理二维张量, 将每行最大值置 1, 最小值置 -1, 其余置 0.
+
+    Args:
+        tensor_2d (np.ndarray): 一个二维 NumPy 数组.
+
+    Returns:
+        np.ndarray: 处理后的二维 NumPy 数组.
+    """
+    processed_tensor = torch.zeros_like(tensor_2d)  # 初始化一个与输入张量形状相同的零张量
+
+    for i in range(tensor_2d.shape[0]): # 遍历每一行
+        row = tensor_2d[i]
+        max_index = torch.argmax(row)      # 找到最大值索引
+        min_index = torch.argmin(row)      # 找到最小值索引
+
+        processed_tensor[i, max_index] = 1   # 将最大值位置置为 1
+        processed_tensor[i, min_index] = -1  # 将最小值位置置为 -1
+
+    return processed_tensor
+
 
 # 4. 实现GRPO损失函数
 def grpo_loss(current_logits, ref_logits, pred_masks, gt_masks, rewards, beta=0.05, clip_param=0.2, gen_log_probs=None):
@@ -218,14 +251,14 @@ def grpo_loss(current_logits, ref_logits, pred_masks, gt_masks, rewards, beta=0.
     # 准备优势函数 (扩展维度以匹配像素数)
     advantages = rewards.view(-1, 1, 1, 1).expand_as(current_logits)
     
-    # 如果有生成时的对数概率，使用PPO的比率裁剪
+    # 如果有生成时的对数概率, 使用PPO的比率裁剪
     if gen_log_probs is not None:
         gen_pixel_log_probs = pred_binary * F.logsigmoid(gen_log_probs) + (1 - pred_binary) * F.logsigmoid(-gen_log_probs)
         ratio = torch.exp(current_pixel_log_probs - gen_pixel_log_probs)
         clipped_ratio = torch.clamp(ratio, 1-clip_param, 1+clip_param)
         per_pixel_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
     else:
-        # 简化版本，直接使用当前对数概率
+        # 简化版本, 直接使用当前对数概率
         per_pixel_loss = -current_pixel_log_probs * advantages
     
     # 添加KL惩罚项
@@ -240,7 +273,7 @@ def grpo_loss(current_logits, ref_logits, pred_masks, gt_masks, rewards, beta=0.
     return masked_loss
 
 # 5. 主要训练循环修改
-def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, beta=0.05, clip_param=0.2, iteration=0, writer=None):
+def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, beta=0.05, clip_param=0.2, iteration=0, writer=None, args=False):
     # 创建参考模型 (如果尚未创建)
     if not hasattr(train_with_grpo, 'ref_model'):
         train_with_grpo.ref_model = create_reference_model(model)
@@ -251,6 +284,7 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
     all_rewards = []
     
     for idx, (image_idx, label_idx) in enumerate(zip(range(image_batch.shape[0]), range(label_batch.shape[0]))):
+        image_idx_in_all_trainset = iteration*image_batch.shape[0]+idx
         image, label = image_batch[image_idx].permute(1, 2, 0).cpu().numpy(), label_batch[label_idx].cpu().numpy()
         
         if label.mean() == 0: 
@@ -310,43 +344,65 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
             # 保存生成时的logits (用于PPO比率计算)
             gen_logits = current_logits.detach()
         
-        # 3. 计算奖励
         adaptive_pool = nn.AdaptiveAvgPool2d(decoded_mask.shape[-2:])
-        pred_binary = (adaptive_pool(current_logits) > 0).float()  # 将预测掩码二值化
         
-        # rewards = compute_segmentation_rewards(
-        #     resized_masks, 
-        #     decoded_mask, 
-        #     torch.from_numpy(image).permute(2, 0, 1).cuda() if len(image.shape) == 3 else torch.from_numpy(image).cuda()
-        # )
-        rewards = current_scores  # 这个需要分组之后再进行标准化
-        
-        # 4. 计算GRPO损失; grpo_loss_v2 已经优化数值范围
-        loss, to_loss, kl_loss, policy_loss, norm_rewards = grpo_loss_v2(
-            adaptive_pool(current_logits), 
-            adaptive_pool(ref_logits), 
-            pred_binary, 
-            decoded_mask, 
-            rewards, 
-            beta=beta, 
-            clip_param=clip_param, 
-            gen_log_probs=adaptive_pool(gen_logits),
-            num_prompts_per_class = num_prompts_per_class
-        )
+        # note: grpo 会出现 loss为负数的情况: https://mp.weixin.qq.com/s/IsPIpsemqtJXNlcb3hJi-A
+        if args.rw_dispered:
+            rewards = continuous_to_dispersed(compute_reward(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class)).flatten()
+        else:
+            rewards = normalize_in_chunks(compute_reward(adaptive_pool(current_logits), decoded_mask.float()), chunk_size=num_prompts_per_class)   # 向量
+
+        if args.is_grpo:
+            advantages = rewards.unsqueeze(-1).unsqueeze(-1).expand_as(adaptive_pool(current_logits))   # 扩展维度以匹配logits (N, 1, 1) -> (N, H, W)
+            loss, per_pixel_loss, kl_div, ppo_obj, sample_loss = grpo_loss_v4(
+                adaptive_pool(current_logits), 
+                adaptive_pool(ref_logits), 
+                decoded_mask, 
+                advantages, 
+                beta=beta, 
+                clip_param=clip_param, 
+                gen_logits=adaptive_pool(gen_logits),
+                num_prompts_per_class = num_prompts_per_class
+            )
+        elif args.is_dpo:
+            rewards = rewards.reshape(-1, num_prompts_per_class)
+            loss, cls_loss = dpo_loss_segmentation(policy_logits=adaptive_pool(current_logits), ref_logits=adaptive_pool(ref_logits), gt_masks=decoded_mask, rewards=rewards, beta=beta)
+        else: raise ValueError
+
+        # 绘图
+        if args is not None and args.debug:
+            from plot_utils import plot_results_np, draw_prompts_on_image, organize_prompts
+            organized_prompts, (class_box_prompts, class_point_prompts)  = organize_prompts(prompts)
+            all_prompts_vis_imgs = []
+            for i_cls in sorted(list(organized_prompts.keys())):
+                result_images = draw_prompts_on_image(image, organized_prompts, class_id=i_cls)
+                all_prompts_vis_imgs.extend(result_images)
+                # for idx in range(len(result_images)):
+                    # plt.figure(); plt.imshow(result_images[idx]); plt.title(f'cls{i_cls}-{idx}'); plt.savefig(f'./cls{i_cls}-{idx}.jpg'); plt.close()
+            save_paths= [os.path.join('./vis_imgs', f'./{image_idx_in_all_trainset}-cls{i_cls}-{idx}.jpg') for i_cls in organized_prompts.keys() for idx in range(len(result_images))]
+            plot_results_np([image] * len(current_logits), all_prompts_vis_imgs, (current_logits > 0).cpu().numpy(), decoded_mask.cpu().numpy(), rewards=rewards.cpu().numpy(), save_paths=save_paths)
+
         if writer is not None:
-            writer.add_scalar('info/to_loss', to_loss.cpu().item(), iteration*image_batch.shape[0]+idx)
-            writer.add_scalar('info/kl_loss', kl_loss.cpu().item(), iteration*image_batch.shape[0]+idx)
-            writer.add_scalar('info/policy_loss', policy_loss.cpu().item(), iteration*image_batch.shape[0]+idx)
-            writer.add_scalar('info/norm_rewards', norm_rewards.cpu().item(), iteration*image_batch.shape[0]+idx)
+            if args.is_grpo:
+                writer.add_scalar('detail/per_pixel_loss', per_pixel_loss.cpu().item(), image_idx_in_all_trainset)
+                writer.add_scalar('detail/kl_div', kl_div.cpu().item(), image_idx_in_all_trainset)
+                writer.add_scalar('detail/ppo_obj', ppo_obj.cpu().item(), image_idx_in_all_trainset)
+                writer.add_scalar('detail/sample_loss', sample_loss.cpu().item(), image_idx_in_all_trainset)
+                writer.add_scalar('detail/rewards', rewards.mean().cpu().item(), image_idx_in_all_trainset)
+            elif args.is_dpo:
+                writer.add_scalar('detail/cls_loss', cls_loss.cpu().item(), image_idx_in_all_trainset)
+                writer.add_scalar('detail/rewards', rewards.mean().cpu().item(), image_idx_in_all_trainset)
+                writer.add_scalar('detail/loss', loss.cpu().item(), image_idx_in_all_trainset)
         batch_losses.append(loss)
-        all_rewards.append(norm_rewards.cpu().item())
+        all_rewards.append(rewards.mean().cpu().item())
     
-    # 如果批次中有有效样本，计算平均损失并优化
+    # 如果批次中有有效样本, 计算平均损失并优化
     if batch_losses:
         total_loss = torch.stack(batch_losses).mean()
         
         optimizer.zero_grad()
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)  # 添加梯度裁剪
         optimizer.step()
         
         avg_reward = np.mean(all_rewards) if all_rewards else 0
@@ -357,25 +413,26 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
     return 0, 0
 
 
-def grpo_loss_v2(current_logits, ref_logits, pred_binary, gt_masks, rewards, beta=0.05, clip_param=0.2, gen_log_probs=None, num_prompts_per_class=3):
+def grpo_loss_v2(current_logits, ref_logits, pred_binary, gen_logits, rewards, beta=0.05, clip_param=0.2, gen_probs=None, num_prompts_per_class=3, rw_temp=1):
     """适用于单通道二值分割的GRPO损失函数"""
     # 输入维度验证
     assert current_logits.dim() == 3 and ref_logits.dim() == 3
     assert pred_binary.shape == current_logits.shape
-    assert gt_masks.shape == current_logits.shape
+    assert gen_logits.shape == current_logits.shape
     assert rewards.dim() == 1 and rewards.shape[0] == current_logits.shape[0]
 
     current_logits = rearrange(current_logits, '(b n) h w -> b n h w', n=num_prompts_per_class)
     ref_logits = rearrange(ref_logits, '(b n) h w -> b n h w', n=num_prompts_per_class)
     pred_binary = rearrange(pred_binary, '(b n) h w -> b n h w', n=num_prompts_per_class)
-    gt_masks = rearrange(gt_masks, '(b n) h w -> b n h w', n=num_prompts_per_class)
-    gen_log_probs = rearrange(gen_log_probs, '(b n) h w -> b n h w', n=num_prompts_per_class) if gen_log_probs is not None else None
+    gen_logits = rearrange(gen_logits, '(b n) h w -> b n h w', n=num_prompts_per_class)
+    gen_probs = rearrange(gen_probs, '(b n) h w -> b n h w', n=num_prompts_per_class) if gen_probs is not None else None
 
     # 在模型输出层添加数值约束（例如限制logits在[-10,10]之间）
     current_logits = torch.clamp(current_logits, -10, 10)
     ref_logits = torch.clamp(ref_logits, -10, 10)
 
-    rewards = rearrange(normalize_in_chunks(rewards, chunk_size=num_prompts_per_class), '(b n) -> b n', n=num_prompts_per_class)    # TODO: 感觉这个计算有问题，会出现负数！！
+    # rewards = rearrange(normalize_in_chunks(rewards, chunk_size=num_prompts_per_class), '(b n) -> b n', n=num_prompts_per_class)
+    rewards = torch.softmax(rewards.view(-1, num_prompts_per_class)/rw_temp, dim=1) # 这个是错误的
 
     batch_size, _, h, w = current_logits.shape
     device = current_logits.device
@@ -406,12 +463,12 @@ def grpo_loss_v2(current_logits, ref_logits, pred_binary, gt_masks, rewards, bet
     advantages = rewards[..., None, None].expand(batch_size, num_prompts_per_class, h, w)  # [15, 3,224,224]
 
     # 生成时的对数概率处理 (如果提供)
-    if gen_log_probs is not None:
+    if gen_probs is not None:
         advantages = advantages.to(device)
-        gen_log_probs = gen_log_probs.to(device)
-        # ratio = torch.exp(current_p_log - gen_log_probs)
+        gen_probs = gen_probs.to(device)
+        # ratio = torch.exp(current_p_log - gen_probs)
         # 在计算ratio时添加保护
-        ratio = torch.exp(torch.clamp(current_p_log - gen_log_probs, min=-5, max=5))
+        ratio = torch.exp(torch.clamp(current_p_log - gen_probs, min=-5, max=5))
         clipped_ratio = torch.clamp(ratio, 1-clip_param, 1+clip_param)
         policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
     else:
@@ -419,14 +476,221 @@ def grpo_loss_v2(current_logits, ref_logits, pred_binary, gt_masks, rewards, bet
         policy_loss = -current_p_log * advantages
 
     # 组合损失项 (策略损失 + KL约束)
-    total_loss =  per_pixel_kl * beta + policy_loss   # TODO: 这里需要进行修改
+    total_loss =  per_pixel_kl * beta + policy_loss
 
     # 计算有效区域掩码 (忽略填充区域)
-    valid_mask = (gt_masks >= 0).float()  # 假设-1表示无效区域
+    valid_mask = (gen_logits >= 0).float()  # 假设-1表示无效区域
 
     # 计算加权平均损失
     masked_loss = (total_loss * valid_mask).sum() / (valid_mask.sum() + 1e-8)
     return masked_loss, total_loss.mean(), per_pixel_kl.mean(), policy_loss.mean(), rewards.mean()
+
+
+def grpo_loss_v3(current_logits, ref_logits, gt_masks, advantages, beta=0.05, clip_param=0.2, gen_logits=None, num_prompts_per_class=3):  
+    # 计算像素级概率
+    current_probs = torch.sigmoid(current_logits)
+    ref_probs = torch.sigmoid(ref_logits)
+    
+    # note: https://github.com/lsdefine/simple_GRPO/blob/a77bfb43abc4297d3d5a6b221863411da837c578/simple_grpo_v1/grpo_ref_split.py#L187
+    gen_probs = torch.sigmoid(gen_logits)  # 生成时的概率
+    
+    # 计算PPO比率 (当前策略/行为策略)
+    ratio = current_probs / (gen_probs + 1e-8)
+    clipped_ratio = torch.clamp(ratio, 1-clip_param, 1+clip_param)
+    
+    # PPO目标函数
+    ppo_obj = torch.min(ratio * advantages, clipped_ratio * advantages)
+    
+    # KL散度惩罚项 (用于约束与参考模型的距离)
+    kl_div = ref_probs * torch.log(ref_probs / (current_probs + 1e-8) + 1e-8) + \
+             (1 - ref_probs) * torch.log((1 - ref_probs) / (1 - current_probs + 1e-8) + 1e-8)
+    
+    # 组合损失 (最大化奖励的同时最小化KL散度)
+    per_pixel_loss = -(ppo_obj - beta * kl_div)   # origin
+
+    criterion = nn.BCEWithLogitsLoss()
+
+    sample_loss = criterion(current_logits, gt_masks.float().cuda())
+    
+    # # 只关注有效区域 (可能需要一个mask来排除填充区域)
+    # valid_mask = (gt_masks != -1).float()  # 假设-1代表忽略区域
+    # loss = (per_pixel_loss * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+    loss = per_pixel_loss.mean() + sample_loss
+
+    return loss, per_pixel_loss.mean(), kl_div.mean(), ppo_obj.mean(), sample_loss
+
+
+def grpo_loss_v4(current_logits, ref_logits, gt_masks, advantages, beta=0.05, clip_param=0.2, gen_logits=None, num_prompts_per_class=3):
+    # 数值截断防止 logits 过大
+    current_logits = torch.clamp(current_logits, -5, 5)
+    ref_logits = torch.clamp(ref_logits, -5, 5)
+    gen_logits = torch.clamp(gen_logits, -5, 5)
+
+    # 计算概率并截断
+    eps = 1e-8
+    current_probs = torch.clamp(torch.sigmoid(current_logits), min=eps, max=1-eps)
+    ref_probs = torch.clamp(torch.sigmoid(ref_logits), min=eps, max=1-eps)
+    gen_probs = torch.clamp(torch.sigmoid(gen_logits), min=eps, max=1-eps)
+
+    # 计算 PPO 比率
+    ratio = current_probs / gen_probs
+    clipped_ratio = torch.clamp(ratio, 1-clip_param, 1+clip_param)
+    ppo_obj = torch.min(ratio * advantages, clipped_ratio * advantages)
+
+    # 修正 KL 散度计算
+    kl_ref_current = ref_probs * (torch.log(ref_probs + eps) - torch.log(current_probs + eps))
+    kl_background = (1 - ref_probs) * (torch.log(1 - ref_probs + eps) - torch.log(1 - current_probs + eps))
+    kl_div = kl_ref_current + kl_background
+
+    # 组合损失
+    # per_pixel_loss = -(ppo_obj - beta * kl_div)
+    per_pixel_loss = ((-(ppo_obj - beta * kl_div))*gt_masks).sum() / (gt_masks.sum() + eps)
+    criterion = nn.BCEWithLogitsLoss()
+    sample_loss = criterion(current_logits, gt_masks.float().cuda())
+    loss = per_pixel_loss.mean() + sample_loss
+
+    return loss, per_pixel_loss.mean(), kl_div.mean(), ppo_obj.mean(), sample_loss
+
+
+def dpo_loss_segmentation(policy_logits, ref_logits, gt_masks, rewards, beta=0.05, criterion=nn.BCEWithLogitsLoss()):
+    """
+    note: https://github.com/modelscope/ms-swift/blob/main/swift/trainers/rlhf_trainer/dpo_trainer.py
+    像素级 DPO Loss for 语义分割 (二分类前景分割).
+
+    Args:
+        policy_logits: 策略模型输出的 logits, shape (batch_size, height, width).
+        ref_logits: 参考模型输出的 logits, shape (batch_size, height, width).
+        gt_masks: 真实标签的二分类掩码, shape (batch_size, height, width).
+        rewards: 
+        beta: DPO 的 beta 参数.
+
+    Returns:
+        loss: DPO loss.
+    """
+    # 1. 计算 log 概率 (像素级别)
+    # policy_chosen_logps = torch.logsigmoid(policy_logits) * chosen_masks.float() # 只计算 chosen mask 区域的 log prob
+    # policy_rejected_logps = torch.logsigmoid(policy_logits) * rejected_masks.float() # 只计算 rejected mask 区域的 log prob
+    # ref_chosen_logps = torch.logsigmoid(ref_logits) * chosen_masks.float()
+    # ref_rejected_logps = torch.logsigmoid(ref_logits) * rejected_masks.float()
+
+    policy_chosen_logps, policy_rejected_logps = F.logsigmoid(policy_logits[torch.argmax(rewards, dim=1)]), F.logsigmoid(policy_logits[torch.argmin(rewards, dim=1)])
+    ref_chosen_logps, ref_rejected_logps = F.logsigmoid(ref_logits[torch.argmax(rewards, dim=1)]), F.logsigmoid(ref_logits[torch.argmin(rewards, dim=1)])
+
+    # 2. 计算 log ratios
+    pi_logratios = policy_chosen_logps - policy_rejected_logps
+    ref_logratios = ref_chosen_logps - ref_rejected_logps
+    logits = pi_logratios - ref_logratios
+
+    # 3. DPO Loss (像素级别)
+    loss = -F.logsigmoid(beta * logits)
+
+    sample_loss = criterion(policy_chosen_logps, gt_masks.float().cuda()[torch.argmax(rewards, dim=1)])
+
+    loss = loss.mean() + sample_loss
+    return loss, sample_loss
+
+# part of grpo_loss_v3
+def f1_score(pred_mask, gt_mask, smooth=1e-6):
+    """
+    计算两个二值掩码之间的F1分数
+    
+    参数:
+        pred_mask: 预测掩码, 形状为[N, H, W]的张量, 值为0或1
+        gt_mask: 真实掩码, 形状为[N, H, W]的张量, 值为0或1
+        smooth: 平滑项, 避免除零错误
+        
+    返回:
+        形状为[N]的F1分数张量, 每个样本一个分数
+    """
+    # 确保输入是二值的
+    pred_mask = (pred_mask > 0.5).float()
+    gt_mask = (gt_mask > 0.5).float()
+    
+    # 计算真阳性(TP)、假阳性(FP)和假阴性(FN)
+    true_positive = (pred_mask * gt_mask).sum(dim=[1, 2])
+    false_positive = (pred_mask * (1 - gt_mask)).sum(dim=[1, 2])
+    false_negative = ((1 - pred_mask) * gt_mask).sum(dim=[1, 2])
+    
+    # 计算精确率和召回率
+    precision = true_positive / (true_positive + false_positive + smooth)
+    recall = true_positive / (true_positive + false_negative + smooth)
+    
+    # 计算F1分数
+    f1 = 2 * (precision * recall) / (precision + recall + smooth)
+    
+    return f1
+
+
+# part of grpo_loss_v3
+def extract_boundary(mask, kernel_size=3):
+    """
+    从二值掩码中提取边界
+    
+    参数:
+        mask: 形状为[N, H, W]的二值掩码张量, 值为0或1
+        kernel_size: 形态学操作的核大小
+    
+    返回:
+        边界掩码, 其中边界像素为1, 其他为0
+    """
+    import torch.nn.functional as F
+    
+    # 确保输入是二值掩码
+    if not torch.all((mask == 0) | (mask == 1)):
+        mask = (mask > 0.5).float()
+    
+    # 创建形态学操作的核
+    kernel = torch.ones(1, 1, kernel_size, kernel_size, device=mask.device)
+    
+    # 添加通道维度[N, H, W] -> [N, 1, H, W]
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    
+    # 膨胀操作
+    dilated = F.conv2d(mask, kernel, padding=kernel_size//2)
+    dilated = (dilated > 0).float()
+    
+    # 腐蚀操作
+    eroded = F.conv2d(mask, kernel, padding=kernel_size//2)
+    eroded = (eroded == kernel_size*kernel_size).float()
+    
+    # 边界 = 膨胀 - 腐蚀
+    boundary = dilated - eroded
+    
+    # 如果原始输入是[N, H, W], 则恢复此形状
+    if mask.dim() == 4 and mask.size(1) == 1:
+        boundary = boundary.squeeze(1)
+    
+    return boundary
+
+
+# part of grpo_loss_v3
+def compute_boundary_accuracy(pred_mask, gt_mask):
+    # 使用形态学操作提取边界
+    pred_boundary = extract_boundary(pred_mask)
+    gt_boundary = extract_boundary(gt_mask)
+    # 计算边界F1分数
+    return f1_score(pred_boundary, gt_boundary)
+
+
+# part of grpo_loss_v3
+def compute_reward(pred_logits, gt_mask):
+    # 将logits转换为二值掩码
+    pred_mask = (pred_logits > 0).float()
+    
+    # 计算IoU (Intersection over Union)
+    intersection = (pred_mask * gt_mask).sum(dim=[1, 2])
+    union = pred_mask.sum(dim=[1, 2]) + gt_mask.sum(dim=[1, 2]) - intersection
+    iou = intersection / (union + 1e-8)
+    
+    # 可以添加额外奖励组件
+    # 例如边缘准确度、平滑度等
+    boundary_accuracy = compute_boundary_accuracy(pred_mask, gt_mask)
+    
+    # 组合奖励
+    rewards = iou + 0.2 * boundary_accuracy
+    return rewards
+
 
 # 6. 定期更新参考模型的函数
 def update_reference_model(model, ref_model, update_ratio=0.1):

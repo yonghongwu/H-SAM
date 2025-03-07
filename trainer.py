@@ -177,6 +177,7 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             b_lr = base_lr
         if args.AdamW:
             optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.model.parameters()), lr=b_lr, betas=(0.9, 0.999), weight_decay=args.weight_decay, eps=1e-5)
+            # optimizer = optim.AdamW([list(model.model.parameters())[-3]], lr=b_lr, betas=(0.9, 0.999), weight_decay=args.weight_decay, eps=1e-5)
         else:
             optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.model.parameters()), lr=b_lr, momentum=0.9, weight_decay=args.weight_decay*0.001)  # Even pass the model.parameters(), the `requires_grad=False` layers will not update
     else: raise ValueError
@@ -207,7 +208,7 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                 transforms.ToTensor(),
                 ])
             img_list = []
-            num_prompts_per_class = 3
+            num_prompts_per_class = args.num_prompts_per_class
             for i in range(image_transform.shape[0]):
                 img = image_transform[i]
                 img = trans(img)
@@ -231,9 +232,9 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                 with amp_context:  # torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16)
                     # 对于不同的 prompt 导致的不同的预测结果, 计算出奖励, 然后使用 GRPO 进行优化: 奖励是由其他模型提供的, 那么怎么对本模型进行优化呢？
                     # 奖励的方式: 训练一个 prompt奖励回归器、基于 iou_prediction、基于预测结果跟 ground truth 的 iou、基于更大的模型
-                    if args.is_po:
+                    if args.is_grpo or args.is_dpo:
                         loss, avg_reward = train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class,
-                                                        iteration=iter_num, writer=writer)
+                                                        beta=args.kl_beta, iteration=iter_num, writer=writer, args=args)
                     else:
                         loss, _ = vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class)
 
@@ -259,9 +260,9 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                 writer.add_scalar('info/loss_dice1', loss_dice1, iter_num)
                 writer.add_scalar('info/loss_ce2', loss_ce2, iter_num)
                 writer.add_scalar('info/loss_dice2', loss_dice2, iter_num)
-            elif args.model == 'sam2' and args.is_po:
+            elif args.model == 'sam2' and args.is_grpo:
                 writer.add_scalar('info/avg_reward', avg_reward, iter_num)
-            else: raise ValueError
+            else: pass
             # writer.add_scalar('info/loss_self2', loss_self, iter_num)
 
             # tqdm.write('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item()))
@@ -272,7 +273,7 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
 
         save_interval = args.interval_epoch # int(max_epoch/6) Todo: 增加参数
         if (epoch_num + 1) % save_interval == 0:
-            save_mode_path = os.path.join(snapshot_path, 'epoch_' + str(epoch_num) + '.pth')
+            save_mode_path = os.path.join(snapshot_path, f'epoch_{epoch_num:03d}.pth')
             if args.model == 'hsam':
                 try:
                     model.save_lora_parameters(save_mode_path)
@@ -286,7 +287,7 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             tqdm.write("save model to {}".format(save_mode_path))
 
         if epoch_num >= max_epoch - 1 or epoch_num >= stop_epoch - 1:
-            save_mode_path = os.path.join(snapshot_path, 'epoch_' + str(epoch_num) + '.pth')
+            save_mode_path = os.path.join(snapshot_path, f'epoch_{epoch_num:03d}.pth')
             if args.model == 'hsam':
                 try:
                     model.save_lora_parameters(save_mode_path)

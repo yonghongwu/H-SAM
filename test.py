@@ -33,7 +33,7 @@ def inference(args, multimask_output, db_config, model, test_save_path=None, sav
         metric_i = test_single_volume(image, label, model, classes=args.num_classes, multimask_output=multimask_output,
                                       patch_size=[args.img_size, args.img_size], input_size=[args.input_size, args.input_size],
                                       test_save_path=test_save_path, case=case_name, z_spacing=db_config['z_spacing'], mode='test',stage=args.stage, 
-                                      model=args.model, save_nii=args.is_savenii)
+                                      model=args.model, save_nii=args.is_savenii, args=args)
         metric_list += np.array(metric_i)
         print('idx %d case %s mean_dice %f mean_hd95 %f' % (
             i_batch, case_name, np.mean(metric_i, axis=0)[0], np.mean(metric_i, axis=0)[1]))
@@ -83,6 +83,7 @@ if __name__ == '__main__':
     parser.add_argument('--mode',  type=str, default='test')
 
     parser.add_argument('--model', type=str, default='hsam', choices=['hsam', 'sam2'], help='模型选择')
+    parser.add_argument('--prompt_type', type=str, default='point', help='point、box、both')
     parser.add_argument('--debug', '-d', action='store_true', help='If activated, debug mode is activated')
 
     args = parser.parse_args()

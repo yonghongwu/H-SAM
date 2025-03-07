@@ -225,7 +225,7 @@ def calculate_metric_percase(pred, gt):
 
 
 def test_single_volume(image, label, net, classes, multimask_output, patch_size=[256, 256], input_size=[224, 224],
-                       test_save_path=None, case=None, z_spacing=1, stage=2, mode='test', model='hsam', save_nii=False):
+                       test_save_path=None, case=None, z_spacing=1, stage=2, mode='test', model='hsam', save_nii=False, args=None):
     lab = label.squeeze(0)
     image, label = image.squeeze(0).cpu().detach().numpy(), label.squeeze(0).cpu().detach().numpy()
     if len(image.shape) == 3:
@@ -287,7 +287,7 @@ def test_single_volume(image, label, net, classes, multimask_output, patch_size=
 
                     # 函数: 接受 image、point、model, 输出 prediction
                     net.set_image(idx_image)
-                    results = get_prompt_preds(net, prompts, prompt_mode='both', multimask_output=True, only_best_score_pred=True, only_save_best_prompt_pred=False)
+                    results = get_prompt_preds(net, prompts, prompt_mode=args.prompt_type, multimask_output=True, only_best_score_pred=True, only_save_best_prompt_pred=False)
                     # all_masks, all_scores, category_indices = concatenate_masks_and_scores_v2(results['prompts_preds'], sort_keys=True)
 
                     cls_in_the_label = list(set(results.keys()) - set(['prompts_preds']))  # plt.imshow((results[7]['mask']>0).cpu().numpy()); plt.savefig('e.jpg')

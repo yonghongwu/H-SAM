@@ -19,6 +19,8 @@ from segment_anything import sam_model_registry
 from trainer import trainer_synapse
 from icecream import ic
 
+import shutil
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
                     default='/data2/zhcheng/train_npz_224', help='root dir for data')
@@ -67,7 +69,14 @@ parser.add_argument('--num_workers', type=int, default=8, help='number of worker
 parser.add_argument('--interval_epoch', type=int, default=50, help='interval epoch for saving')
 
 parser.add_argument('--model', type=str, default='sam2', choices=['hsam', 'sam2'], help='模型选择')
-parser.add_argument('--is_po', action='store_true', help='是否使用XPO优化')
+parser.add_argument('--is_grpo', action='store_true', help='是否使用grPO优化')
+parser.add_argument('--is_dpo', action='store_true', help='是否使用DPO优化')
+parser.add_argument('--rw_dispered', action='store_true', help='是否使用离散的奖励机制')
+
+parser.add_argument('--num_prompts_per_class', type=int, default=3, help='对于一张图像, 会采样出多少个prompt, 等于GRPO组的大小')
+parser.add_argument('--kl_beta', type=float, default=0.05, help='调控KL散度')
+parser.add_argument('--ours_use_lora', action='store_true', help='我们的方法是否使用lora')
+
 # parser.add_argument('--mixed_precision', type=str, default='no', choices=['no', 'fp16', 'bf16'], help='混合精度训练类型: no=禁用, fp16=float16, bf16=bfloat16')
 parser.add_argument('--precision', type=str, default='float32', choices=['float32', 'float16', 'bfloat16'], help='训练精度: float32=全精度, float16=半精度, bfloat16=BF16精度')
 
@@ -78,6 +87,7 @@ if args.debug:
     args.n_gpu = int(torch.cuda.device_count())
     if args.model == 'sam2':
         args.root_path = '/new_wyh/Synapse-multi-organ-CT-dataset/train_npz_new_224_with_foreground/'
+        args.is_grpo = True
     elif args.model == 'hsam':
         args.root_path = '/new_wyh/Synapse-multi-organ-CT-dataset/train_npz_new_224/'
     args.split = 'train'
@@ -119,7 +129,14 @@ if __name__ == "__main__":
     args.exp = dataset_name + '_' + str(args.img_size)
     tz = pytz.timezone('Asia/Shanghai')  # 东八区对应的时区
     current_time = datetime.datetime.now(tz).strftime("%Y%m%d_%H%M%S")
-    snapshot_path = os.path.join(args.output, args.model, "{}_{}".format(current_time, args.exp))
+    
+    if args.is_grpo:
+        po_type = 'grpo_dispered' if args.rw_dispered else 'grpo'
+    elif args.is_dpo:
+        po_type = 'dpo'
+    else:
+        po_type = 'nopo'
+    snapshot_path = os.path.join(args.output, args.model, f"{po_type}", "{}_{}".format(current_time, args.exp))
     snapshot_path = snapshot_path + '_pretrain' if args.is_pretrain else snapshot_path
     snapshot_path += '_' + args.vit_name
     snapshot_path = snapshot_path + '_' + str(args.max_iterations)[
@@ -131,6 +148,12 @@ if __name__ == "__main__":
 
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
+
+    code_dir = os.path.join(snapshot_path, 'code')
+    if not os.path.exists(code_dir):
+        ignore_patterns = ['__pycache__', '.pytest_cache', '.git', '.vscode', 'data', 'checkpoints', 'env_hsam', 'env_hsam_copy', 'figure', 'output', 'sam2-main',
+                        'segment_anything', 'test_outputs', 'testset', 'vis_imgs', '*.pth', '*.npy']
+        shutil.copytree('../hsam_code', code_dir, ignore=shutil.ignore_patterns(*ignore_patterns))
 
     # register model
     if args.model == 'hsam':
@@ -160,6 +183,14 @@ if __name__ == "__main__":
             model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
         else: raise ValueError
         sam2 = build_sam2(model_cfg, checkpoint)
+        image_size = sam2.image_size
+
+        if args.ours_use_lora:  # Todo: 需要修改代码
+            pkg = import_module(args.module)
+            sam2 = pkg.LoRA_Sam(sam2, args.rank).cuda()
+            sam2.image_size = image_size
+            sam2.device = 'cuda'
+
         net = SAM2ImagePredictor(sam2)
 
         # 沿用 hsam 的设置

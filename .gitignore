@@ -6,3 +6,20 @@
 /checkpoints
 
 __pycache__
+.vscode
+220_epoch_299.pth
+LICENSE
+testset/test_vol_h5
+lists/*
+
+/sam2*
+
+*.jpg
+*.png
+mask.npy
+raw.npy
+/test_outputs
+
+/*.ipynb
+
+/data
