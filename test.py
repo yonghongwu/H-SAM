@@ -37,7 +37,7 @@ def inference(args, multimask_output, db_config, model, test_save_path=None, sav
         metric_list += np.array(metric_i)
         print('idx %d case %s mean_dice %f mean_hd95 %f' % (
             i_batch, case_name, np.mean(metric_i, axis=0)[0], np.mean(metric_i, axis=0)[1]))
-        break
+        # break
     metric_list = metric_list / len(db_test)
     for i in range(1, args.num_classes + 1):
         try:
@@ -84,6 +84,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--model', type=str, default='hsam', choices=['hsam', 'sam2'], help='模型选择')
     parser.add_argument('--prompt_type', type=str, default='point', help='point、box、both')
+    parser.add_argument('--point_strict', action='store_true', help='')
     parser.add_argument('--debug', '-d', action='store_true', help='If activated, debug mode is activated')
 
     args = parser.parse_args()

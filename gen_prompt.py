@@ -14,6 +14,7 @@ def generate_prompts_from_semantic_mask(
     num_negative_points: Union[int, Tuple[int, int]] = (0, 2),  # 每个类别生成的负样本点数量
     num_prompts_per_class: int = 1,  # 每个类别生成的prompt组数
     point_sampling_strategy: str = "random",  # "random", "center_weighted", "edge_weighted"
+    is_strict=False,
     box_noise_level: float = 0.05,  # 边界框的随机扰动程度(相对于对象尺寸的比例)
     generate_box: bool = True,
     generate_points: bool = True,
@@ -35,7 +36,7 @@ def generate_prompts_from_semantic_mask(
         generate_points: 是否生成点提示
         return_visualization: 是否返回可视化结果
         visualization_colors: 可视化时每个类别的颜色, 格式为 {class_id: (R, G, B)}
-        
+        is_strict: 负样本只在bounding box和mask不交集的地方选择。
     返回:
         包含生成的提示的字典, 格式为:
         {
@@ -201,26 +202,62 @@ def generate_prompts_from_semantic_mask(
                     # 添加正样本点 (is_foreground=1)
                     point_prompts.append((int(x), int(y), 1))
                 
-                # 生成负样本点(背景点)
+                # # 生成负样本点(背景点)
+                # if isinstance(num_negative_points, tuple):
+                #     n_neg_points = random.randint(num_negative_points[0], num_negative_points[1])
+                # else:
+                #     n_neg_points = num_negative_points
+                
+                # for _ in range(n_neg_points):
+                #     # 生成背景点 (当前类别掩码外的点)
+                #     attempts = 0
+                #     max_attempts = 100  # 防止无限循环
+                    
+                #     while attempts < max_attempts:
+                #         x = random.randint(0, w - 1)
+                #         y = random.randint(0, h - 1)
+                #         # 确保点不在当前类别的掩码内
+                #         if not binary_mask[y, x]:
+                #             break
+                #         attempts += 1
+                    
+                #     # 如果无法找到背景点, 则跳过
+                #     if attempts >= max_attempts:
+                #         continue
+                    
+                #     # 添加负样本点 (is_foreground=0)
+                #     point_prompts.append((int(x), int(y), 0))
+
+                    # 生成负样本点(背景点)
                 if isinstance(num_negative_points, tuple):
                     n_neg_points = random.randint(num_negative_points[0], num_negative_points[1])
                 else:
                     n_neg_points = num_negative_points
                 
                 for _ in range(n_neg_points):
-                    # 生成背景点 (当前类别掩码外的点)
+                    # 生成背景点
                     attempts = 0
                     max_attempts = 100  # 防止无限循环
                     
                     while attempts < max_attempts:
-                        x = random.randint(0, w - 1)
-                        y = random.randint(0, h - 1)
-                        # 确保点不在当前类别的掩码内
-                        if not binary_mask[y, x]:
-                            break
+                        if is_strict and generate_box:
+                            # 严格模式：在边界框内的非目标区域采样
+                            x_min, y_min, x_max, y_max = prompt_result["box_prompt"]
+                            x = random.randint(x_min, x_max)
+                            y = random.randint(y_min, y_max)
+                            # 确保点在边界框内且不在当前类别的掩码内
+                            if x_min <= x <= x_max and y_min <= y <= y_max and not binary_mask[y, x]:
+                                break
+                        else:
+                            # 原有模式：在整个图像的非目标区域采样
+                            x = random.randint(0, w - 1)
+                            y = random.randint(0, h - 1)
+                            # 确保点不在当前类别的掩码内
+                            if not binary_mask[y, x]:
+                                break
                         attempts += 1
                     
-                    # 如果无法找到背景点, 则跳过
+                    # 如果无法找到背景点，则跳过
                     if attempts >= max_attempts:
                         continue
                     
@@ -332,8 +369,6 @@ def concatenate_masks_and_scores(category_dict):
     
     return all_masks, all_scores
 
-
-import torch
 
 def concatenate_masks_and_scores_v2(category_dict, sort_keys=True):
     """
@@ -493,34 +528,37 @@ def get_prompt_preds(predictor, prompts, prompt_mode='box', multimask_output=Tru
 
 def plot_results(results, image: np.ndarray, mask: np.ndarray, plot_prompts_preds=False, save_path_lst=None):
     # 画同一行显示的三个图像(子图)
-    results_prompts_preds = results.pop('prompts_preds')
-    for idx, i in enumerate(results.keys()):
-        tmp = results[i]['mask']
-        if idx == 0:
-            final_pred = np.zeros_like(tmp)
-        final_pred += (idx+1) * tmp
-    
-    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-    axs[0].imshow(image); axs[0].set_title('Image')
-    axs[1].imshow(final_pred); axs[1].set_title('Final Prediction')
-    axs[2].imshow(mask); axs[2].set_title('mask')
-    plt.savefig(save_path_lst[0]) if save_path_lst is not None else None
-    
-    # -------------------------------------------------------------------
-    # 对于 保存了每一个prompt的预测结果的情况, 需要通过下面的方式打印出结果
-    if plot_prompts_preds:
-        ith_prompt_pred_in_cls = 0    # 获取每一个类别中的第一个prompt的预测结果
-        for idx, i in enumerate(results_prompts_preds.keys()):
-            tmp = results_prompts_preds[i][ith_prompt_pred_in_cls]['mask']
+    with torch.no_grad():
+        results_prompts_preds = results.pop('prompts_preds')
+        for idx, i in enumerate(results.keys()):
+            tmp = (results[i]['mask'].cpu().numpy() > 0).astype(int)
             if idx == 0:
                 final_pred = np.zeros_like(tmp)
             final_pred += (idx+1) * tmp
-
+        
+        plt.figure()
         fig, axs = plt.subplots(1, 3, figsize=(15, 5))
         axs[0].imshow(image); axs[0].set_title('Image')
-        axs[1].imshow(final_pred); axs[1].set_title('Final Prediction')
-        axs[2].imshow(mask); axs[2].set_title('mask')
-        plt.savefig(save_path_lst[-1]) if save_path_lst is not None else None
+        axs[1].imshow(mask); axs[2].set_title('mask')
+        axs[2].imshow(final_pred); axs[1].set_title('Final Prediction')
+        plt.savefig(save_path_lst[0]) if save_path_lst is not None else None
+        
+        # -------------------------------------------------------------------
+        # 对于 保存了每一个prompt的预测结果的情况, 需要通过下面的方式打印出结果
+        if plot_prompts_preds:
+            ith_prompt_pred_in_cls = 0    # 获取每一个类别中的第一个prompt的预测结果
+            for idx, i in enumerate(results_prompts_preds.keys()):
+                tmp = (results_prompts_preds[i][ith_prompt_pred_in_cls]['mask'].cpu().numpy() > 0).astype(int)
+                if idx == 0:
+                    final_pred = np.zeros_like(tmp)
+                final_pred += (idx+1) * tmp
+            
+            plt.figure()
+            fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+            axs[0].imshow(image); axs[0].set_title('Image')
+            axs[1].imshow(final_pred); axs[1].set_title('Final Prediction')
+            axs[2].imshow(mask); axs[2].set_title('mask')
+            plt.savefig(save_path_lst[-1]) if save_path_lst is not None else None
 
 
 
