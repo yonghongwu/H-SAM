@@ -72,6 +72,9 @@ parser.add_argument('--model', type=str, default='sam2', choices=['hsam', 'sam2'
 parser.add_argument('--is_grpo', action='store_true', help='是否使用grPO优化')
 parser.add_argument('--is_dpo', action='store_true', help='是否使用DPO优化')
 parser.add_argument('--rw_dispered', action='store_true', help='是否使用离散的奖励机制')
+parser.add_argument('--rw_temp', type=float, default=1., help='奖励的温度')
+parser.add_argument('--grpo_KL_weight', action='store_true', help='')
+parser.add_argument('--weight_temp', type=float, default=1., help='在grpo中使用权重进行调节KL的惩罚力度, 温度越小则惩罚越大(类别之间的惩罚力度差距会变大)')
 
 parser.add_argument('--num_prompts_per_class', type=int, default=3, help='对于一张图像, 会采样出多少个prompt, 等于GRPO组的大小')
 parser.add_argument('--kl_beta', type=float, default=0.05, help='调控KL散度')
@@ -79,7 +82,7 @@ parser.add_argument('--ours_use_lora', action='store_true', help='我们的方�
 
 # parser.add_argument('--mixed_precision', type=str, default='no', choices=['no', 'fp16', 'bf16'], help='混合精度训练类型: no=禁用, fp16=float16, bf16=bfloat16')
 parser.add_argument('--precision', type=str, default='float32', choices=['float32', 'float16', 'bfloat16'], help='训练精度: float32=全精度, float16=半精度, bfloat16=BF16精度')
-
+parser.add_argument('--desc', type=str, default='none', help='实验说明')
 args = parser.parse_args()
 
 if args.debug:
@@ -88,6 +91,10 @@ if args.debug:
     if args.model == 'sam2':
         args.root_path = '/new_wyh/Synapse-multi-organ-CT-dataset/train_npz_new_224_with_foreground/'
         args.is_grpo = True
+        args.rw_dispered = False
+        args.rw_temp = 3
+        args.grpo_KL_weight = True
+        args.weight_temp = 0.5
     elif args.model == 'hsam':
         args.root_path = '/new_wyh/Synapse-multi-organ-CT-dataset/train_npz_new_224/'
     args.split = 'train'

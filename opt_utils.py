@@ -79,7 +79,7 @@ def create_reference_model(model):
 
 
 # 每3个元素为一组进行标准化
-def normalize_in_chunks(x, chunk_size):
+def normalize_in_chunks(x, chunk_size, temperature=1.0):
     # 复制结果张量
     result = x.clone()
     
@@ -88,7 +88,7 @@ def normalize_in_chunks(x, chunk_size):
         chunk = x[i:i+chunk_size]
         mean = chunk.mean()
         std = chunk.std(unbiased=False)  # 使用无偏估计
-        result[i:i+chunk_size] = (chunk - mean) / std
+        result[i:i+chunk_size] = (chunk - mean) / (std + 1e-8) / temperature
 
     return result
 
@@ -222,15 +222,69 @@ def continuous_to_dispersed(tensor_2d):
         min_index = torch.argmin(row)      # 找到最小值索引
 
         processed_tensor[i, max_index] = 1   # 将最大值位置置为 1
-        processed_tensor[i, min_index] = -1  # 将最小值位置置为 -1
+        # processed_tensor[i, min_index] = -1  # 将最小值位置置为 -1
 
     return processed_tensor
+
+
+def continuous_to_dispersed_v2(policy_values, scheme=1):
+    """
+    计算不同方案下的策略奖励值
+    
+    参数:
+        policy_values: 形状为(N, L)的张量, N是数据量, L是策略数量
+        scheme: 使用的方案, 1表示第一个方案, 2表示第二个方案
+        
+    返回:
+        rewards: 形状为(N, L)的张量, 表示每个策略的奖励值
+    """
+    # 确保输入是张量
+    if not isinstance(policy_values, torch.Tensor):
+        policy_values = torch.tensor(policy_values, dtype=torch.float32)
+    
+    # 创建与输入相同形状的奖励张量
+    rewards = torch.zeros_like(policy_values)
+    
+    if scheme == 1:
+        # 第一个方案：基于固定阈值的奖励计算
+        # 当策略值大于0.85, 则奖励为1
+        rewards[policy_values > 0.85] = 1.0
+        # 当小于0.85而大于0.5时, 奖励为0.5
+        rewards[(policy_values <= 0.85) & (policy_values > 0.5)] = 0.5
+        # 当奖励小于0.5而大于0.2时, 奖励为0（默认已经为0, 不需要额外设置）
+        rewards[(policy_values <= 0.2)] = -1
+    
+    elif scheme == 2:
+        # 第二个方案：基于每条数据中策略最小值的相对差值
+        N, L = policy_values.shape
+        
+        # 对每条数据单独处理
+        for n in range(N):
+            # 获取当前数据的所有策略值
+            current_policies = policy_values[n]
+            # 找到最小策略值
+            min_value = torch.min(current_policies)
+            # 计算每个策略值与最小值的差值
+            differences = current_policies - min_value
+            
+            # 根据差值计算奖励
+            # 差值大于0.2, 奖励为2
+            rewards[n][differences > 0.2] = 2.0
+            # 差值小于0.2但大于0.02, 奖励为1
+            rewards[n][(differences <= 0.2) & (differences > 0.02)] = 1.0
+            # 差值小于0.02, 奖励为0（默认已经为0, 不需要额外设置）
+            # 最小值对应的位置, 奖励恒为0（由于差值为0, 所以默认已经为0）
+    
+    else:
+        raise ValueError("方案参数必须为1或2")
+    
+    return rewards
 
 
 # 4. 实现GRPO损失函数
 def grpo_loss(current_logits, ref_logits, pred_masks, gt_masks, rewards, beta=0.05, clip_param=0.2, gen_log_probs=None):
     """计算GRPO损失"""
-    # 计算当前模型的对数概率    # Todo: 确定 pred_masks 的size要跟logits一致
+    # 计算当前模型的对数概率
     current_log_probs = F.logsigmoid(current_logits)
     neg_current_log_probs = F.logsigmoid(-current_logits)
     
@@ -305,8 +359,8 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
         )
         
         decoded_mask = prompts['decoded_mask']
-        exist_keys = sorted(decoded_mask.keys())
-        for key in exist_keys:
+        class_keys = sorted(decoded_mask.keys())
+        for key in class_keys:
             decoded_mask[key] = torch.from_numpy(decoded_mask[key])[None].long().repeat(num_prompts_per_class, 1, 1)
         decoded_mask = torch.concat(list(decoded_mask.values()), dim=0).cuda()
         
@@ -317,7 +371,7 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
         # 1. 获取当前模型预测
         with torch.enable_grad():  # 确保启用梯度
             results = get_prompt_preds(
-                model, prompts, prompt_mode='point', 
+                model, prompts, prompt_mode='both', 
                 multimask_output=True, 
                 only_best_score_pred=True, 
                 only_save_best_prompt_pred=False,
@@ -348,18 +402,34 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
         
         # note: grpo 会出现 loss为负数的情况: https://mp.weixin.qq.com/s/IsPIpsemqtJXNlcb3hJi-A
         if args.rw_dispered:
-            rewards = continuous_to_dispersed(compute_reward(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class)).flatten()
+            # rewards = continuous_to_dispersed(compute_reward(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class)).flatten()
+            rewards1 = continuous_to_dispersed_v2(compute_reward(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class), scheme=1)
+            rewards2 = continuous_to_dispersed_v2(compute_reward(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class), scheme=2)
+            rewards = (rewards1 + rewards2).flatten()
+
+            log_structured_rewards_stats(rewards1, num_prompts_per_class, step=image_idx_in_all_trainset, logger=writer, class_keys=class_keys, name='rewards1')
+            log_structured_rewards_stats(rewards2, num_prompts_per_class, step=image_idx_in_all_trainset, logger=writer, class_keys=class_keys, name='rewards2')
+
         else:
-            rewards = normalize_in_chunks(compute_reward(adaptive_pool(current_logits), decoded_mask.float()), chunk_size=num_prompts_per_class)   # 向量
+            rewards = normalize_in_chunks(compute_reward(adaptive_pool(current_logits), decoded_mask.float()), chunk_size=num_prompts_per_class, temperature=args.rw_temp)   # 向量
+        
+        if args.grpo_KL_weight:
+            cls_weights = torch.softmax(
+                1 / normalize_in_chunks(
+                    compute_reward(adaptive_pool(current_logits), decoded_mask.float()), 
+                    chunk_size=num_prompts_per_class, temperature=2).reshape(-1, 3).max(dim=1)[0] / args.weight_temp, 
+                dim=0)
+            cls_weights = cls_weights[None].repeat(num_prompts_per_class, 1).transpose(0, 1).flatten().cuda()
 
         if args.is_grpo:
             advantages = rewards.unsqueeze(-1).unsqueeze(-1).expand_as(adaptive_pool(current_logits))   # 扩展维度以匹配logits (N, 1, 1) -> (N, H, W)
-            loss, per_pixel_loss, kl_div, ppo_obj, sample_loss = grpo_loss_v4(
+            loss, kl_div, sample_loss = grpo_loss_v4(
                 adaptive_pool(current_logits), 
                 adaptive_pool(ref_logits), 
                 decoded_mask, 
                 advantages, 
                 beta=beta, 
+                weights=cls_weights if args.grpo_KL_weight else None,
                 clip_param=clip_param, 
                 gen_logits=adaptive_pool(gen_logits),
                 num_prompts_per_class = num_prompts_per_class
@@ -384,9 +454,9 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
 
         if writer is not None:
             if args.is_grpo:
-                writer.add_scalar('detail/per_pixel_loss', per_pixel_loss.cpu().item(), image_idx_in_all_trainset)
+                # writer.add_scalar('detail/per_pixel_loss', per_pixel_loss.cpu().item(), image_idx_in_all_trainset)
                 writer.add_scalar('detail/kl_div', kl_div.cpu().item(), image_idx_in_all_trainset)
-                writer.add_scalar('detail/ppo_obj', ppo_obj.cpu().item(), image_idx_in_all_trainset)
+                # writer.add_scalar('detail/ppo_obj', ppo_obj.cpu().item(), image_idx_in_all_trainset)
                 writer.add_scalar('detail/sample_loss', sample_loss.cpu().item(), image_idx_in_all_trainset)
                 writer.add_scalar('detail/rewards', rewards.mean().cpu().item(), image_idx_in_all_trainset)
             elif args.is_dpo:
@@ -520,7 +590,7 @@ def grpo_loss_v3(current_logits, ref_logits, gt_masks, advantages, beta=0.05, cl
     return loss, per_pixel_loss.mean(), kl_div.mean(), ppo_obj.mean(), sample_loss
 
 
-def grpo_loss_v4(current_logits, ref_logits, gt_masks, advantages, beta=0.05, clip_param=0.2, gen_logits=None, num_prompts_per_class=3):
+def grpo_loss_v4(current_logits, ref_logits, gt_masks, advantages, beta=0.05, clip_param=0.2, gen_logits=None, num_prompts_per_class=3, weights=None, criterion=nn.BCEWithLogitsLoss()):
     # 数值截断防止 logits 过大
     current_logits = torch.clamp(current_logits, -5, 5)
     ref_logits = torch.clamp(ref_logits, -5, 5)
@@ -540,16 +610,18 @@ def grpo_loss_v4(current_logits, ref_logits, gt_masks, advantages, beta=0.05, cl
     # 修正 KL 散度计算
     kl_ref_current = ref_probs * (torch.log(ref_probs + eps) - torch.log(current_probs + eps))
     kl_background = (1 - ref_probs) * (torch.log(1 - ref_probs + eps) - torch.log(1 - current_probs + eps))
-    kl_div = kl_ref_current + kl_background
+    if weights is not None:
+        kl_div = (kl_ref_current + kl_background) * beta * weights.unsqueeze(-1).unsqueeze(-1)
+    else:
+        kl_div = (kl_ref_current + kl_background) * beta
 
     # 组合损失
     # per_pixel_loss = -(ppo_obj - beta * kl_div)
-    per_pixel_loss = ((-(ppo_obj - beta * kl_div))*gt_masks).sum() / (gt_masks.sum() + eps)
-    criterion = nn.BCEWithLogitsLoss()
+    per_pixel_loss = ((-(ppo_obj - kl_div))*gt_masks).sum() / (gt_masks.sum() + eps)
     sample_loss = criterion(current_logits, gt_masks.float().cuda())
     loss = per_pixel_loss.mean() + sample_loss
 
-    return loss, per_pixel_loss.mean(), kl_div.mean(), ppo_obj.mean(), sample_loss
+    return loss, kl_div.mean(), sample_loss
 
 
 def dpo_loss_segmentation(policy_logits, ref_logits, gt_masks, rewards, beta=0.05, criterion=nn.BCEWithLogitsLoss()):
@@ -685,10 +757,10 @@ def compute_reward(pred_logits, gt_mask):
     
     # 可以添加额外奖励组件
     # 例如边缘准确度、平滑度等
-    boundary_accuracy = compute_boundary_accuracy(pred_mask, gt_mask)
+    # boundary_accuracy = compute_boundary_accuracy(pred_mask, gt_mask)
     
     # 组合奖励
-    rewards = iou + 0.2 * boundary_accuracy
+    rewards = iou # + 0.2 * boundary_accuracy
     return rewards
 
 
@@ -698,3 +770,57 @@ def update_reference_model(model, ref_model, update_ratio=0.1):
     with torch.no_grad():
         for param, ref_param in zip(model.parameters(), ref_model.parameters()):
             ref_param.data.copy_(update_ratio * param.data + (1 - update_ratio) * ref_param.data)
+
+
+def log_advantage_stats(rewards, step, logger):
+    """记录rewards的多个统计量"""
+    stats = {
+        "rewards/max": rewards.max().item(),
+        "rewards/min": rewards.min().item(),
+        "rewards/mean": rewards.mean().item(),
+        "rewards/std": rewards.std().item(),
+        "rewards/abs_max": rewards.abs().max().item(),  # 绝对值最大值, 特别重要
+        "rewards/range": rewards.max().item() - rewards.min().item()
+    }
+    
+    # 可选：计算大值的比例
+    large_adv_ratio = (rewards.abs() > 5.0).float().mean().item()
+    stats["rewards/large_value_ratio"] = large_adv_ratio
+    
+    # 记录到你的日志系统
+    for name, value in stats.items():
+        logger.add_scalar(name, value, step)
+    
+    return stats
+
+
+def log_structured_rewards_stats(rewards, num_prompts_per_class, step, logger, class_keys, name='rewards'):
+    """记录结构化rewards的统计量"""
+    
+    # 全局统计量
+    flat_adv = rewards.view(-1)
+    global_stats = {
+        f"{name}/global_max": flat_adv.max().item(),
+        f"{name}/global_min": flat_adv.min().item(),
+        f"{name}/global_mean": flat_adv.mean().item(),
+        f"{name}/global_std": flat_adv.std().item(),
+        f"{name}/global_abs_max": flat_adv.abs().max().item(),
+    }
+    
+    # 按类别统计
+    rewards = rewards.reshape(-1, num_prompts_per_class)
+    for c, cname in zip(range(rewards.shape[0]), class_keys):
+        class_adv = rewards[c]
+        prefix = f"{name}/class_{cname}/"
+        class_stats = {
+            f"{prefix}max": class_adv.max().item(),
+            f"{prefix}mean": class_adv.mean().item(),
+            f"{prefix}std": class_adv.std().item(),
+        }
+        global_stats.update(class_stats)
+    
+    # 记录到日志系统
+    for name, value in global_stats.items():
+        logger.add_scalar(name, value, step)
+    
+    return global_stats

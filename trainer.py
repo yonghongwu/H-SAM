@@ -233,7 +233,7 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                     # 对于不同的 prompt 导致的不同的预测结果, 计算出奖励, 然后使用 GRPO 进行优化: 奖励是由其他模型提供的, 那么怎么对本模型进行优化呢？
                     # 奖励的方式: 训练一个 prompt奖励回归器、基于 iou_prediction、基于预测结果跟 ground truth 的 iou、基于更大的模型
                     if args.is_grpo or args.is_dpo:
-                        loss, avg_reward = train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class,
+                        loss, _ = train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class,
                                                         beta=args.kl_beta, iteration=iter_num, writer=writer, args=args)
                     else:
                         loss, _ = vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class)
@@ -261,7 +261,7 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                 writer.add_scalar('info/loss_ce2', loss_ce2, iter_num)
                 writer.add_scalar('info/loss_dice2', loss_dice2, iter_num)
             elif args.model == 'sam2' and args.is_grpo:
-                writer.add_scalar('info/avg_reward', avg_reward, iter_num)
+                pass # writer.add_scalar('info/avg_reward', avg_reward, iter_num)
             else: pass
             # writer.add_scalar('info/loss_self2', loss_self, iter_num)
 

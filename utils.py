@@ -268,13 +268,14 @@ def test_single_volume(image, label, net, classes, multimask_output, patch_size=
                     prompts = generate_prompts_from_semantic_mask(
                         idx_label,
                         class_ids=None,  # 处理所有类别
-                        num_positive_points=(2, 3),
-                        num_negative_points=(4, 6),
+                        num_positive_points=1,
+                        num_negative_points=(1, 3),
                         num_prompts_per_class=3,  # 每个类别生成3组prompt
                         point_sampling_strategy="center_weighted",
                         box_noise_level=0.1,
                         generate_box=True,
-                        generate_points=True
+                        generate_points=True,
+                        is_strict=args.point_strict
                     )
 
                     decoded_mask = prompts['decoded_mask']
