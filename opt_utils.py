@@ -1,12 +1,14 @@
 import os
+import cv2
 import torch 
+import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torch import nn
 from einops import rearrange
 from gen_prompt import generate_prompts_from_semantic_mask, get_prompt_preds, concatenate_masks_and_scores_v2, plot_results
+from utils import get_decoded_mask
 
-
-def vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3):
+def vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, args=None):
     batch_losses = []
     for image_idx, label_idx in zip(range(image_batch.shape[0]), range(label_batch.shape[0])):
         image, label = image_batch[image_idx].permute(1, 2, 0).cpu().numpy(), label_batch[label_idx].cpu().numpy()   # low_res_label_batch[0].cpu().numpy()
@@ -36,7 +38,7 @@ def vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_
 
         # 函数: 接受 image、point、model, 输出 prediction
         model.set_image(image)
-        results = get_prompt_preds(model, prompts, prompt_mode='point', multimask_output=True, only_best_score_pred=True, only_save_best_prompt_pred=False)
+        results = get_prompt_preds(model, prompts, prompt_mode=args.prompt_type, multimask_output=True, only_best_score_pred=True, only_save_best_prompt_pred=False)
         all_logits, all_scores, category_indices = concatenate_masks_and_scores_v2(results['prompts_preds'], sort_keys=True)
 
         criterion = nn.BCEWithLogitsLoss()
@@ -60,6 +62,55 @@ def vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_
         loss.backward()
         optimizer.step()
     return loss.item(), None
+
+
+@torch.no_grad()
+def vanilla_eva(model, image_batch, label_batch, num_prompts_per_class=3, args=None):
+    batch_losses, batch_ious = [], []
+    for image_idx, label_idx in zip(range(image_batch.shape[0]), range(label_batch.shape[0])):
+        image, label = image_batch[image_idx].permute(1, 2, 0).cpu().numpy(), label_batch[label_idx].cpu().numpy()   # low_res_label_batch[0].cpu().numpy()
+
+        if label.mean() == 0: print("无前景; Skip"); continue
+
+        # 获取 prompts、二值化的多类别掩码
+        prompts = generate_prompts_from_semantic_mask(
+            label,
+            class_ids=None,  # 处理所有类别
+            num_positive_points=1,
+            num_negative_points=0,
+            num_prompts_per_class=num_prompts_per_class,  # 每个类别生成3组prompt
+            point_sampling_strategy="center_weighted",
+            box_noise_level=0.1,
+            generate_box=True,
+            generate_points=True
+        )
+
+        decoded_mask = get_decoded_mask(prompts['decoded_mask'], num_prompts_per_class=num_prompts_per_class)
+
+        # 函数: 接受 image、point、model, 输出 prediction
+        model.set_image(image)
+        results = get_prompt_preds(model, prompts, prompt_mode=args.prompt_type, multimask_output=True, only_best_score_pred=True, only_save_best_prompt_pred=False)
+        all_logits, all_scores, category_indices = concatenate_masks_and_scores_v2(results['prompts_preds'], sort_keys=True)
+
+        criterion = nn.BCEWithLogitsLoss()
+        adaptive_pool = nn.AdaptiveAvgPool2d(decoded_mask.shape[-2:])
+
+        sample_loss = criterion(adaptive_pool(all_logits), decoded_mask.float().cuda())
+        batch_losses.append(sample_loss)
+
+        sample_iou = compute_iou(adaptive_pool(all_logits), decoded_mask.float().cuda())
+        batch_ious.append(sample_iou)
+
+        # 展示结果
+        # plot_results(results, image, label, plot_prompts_preds=True, save_path_lst=None)
+        coupled_mask = np.zeros_like(label, dtype=np.uint8) # size: (H, W)
+        for idx, i in enumerate(sorted(set(np.unique(label).astype(np.uint8)) - set([0]))):
+            coupled_mask += (adaptive_pool(all_logits) > 0).cpu().numpy().astype(np.uint8)[idx] * i
+
+    loss = torch.stack(batch_losses).mean()
+    iou = np.stack(batch_ious).mean()
+
+    return loss.item(), iou
 
 
 import torch
@@ -326,6 +377,7 @@ def grpo_loss(current_logits, ref_logits, pred_masks, gt_masks, rewards, beta=0.
     
     return masked_loss
 
+
 # 5. 主要训练循环修改
 def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, beta=0.05, clip_param=0.2, iteration=0, writer=None, args=False):
     # 创建参考模型 (如果尚未创建)
@@ -345,17 +397,25 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
             # print("无前景; Skip")
             continue
         
+        if isinstance(args.pos_point_num, tuple):
+            num_pos_points = np.random.randint(*args.pos_point_num, size=(1))[0]
+        else: num_pos_points = args.pos_point_num
+        if isinstance(args.neg_point_num, tuple):
+            num_neg_points = np.random.randint(*args.neg_point_num, size=(1))[0]
+        else: num_neg_points = args.neg_point_num
+        
         # 获取prompts和GT掩码 (与原代码相同)
         prompts = generate_prompts_from_semantic_mask(
             label,
             class_ids=None,
-            num_positive_points=(2, 3),
-            num_negative_points=(4, 6),
+            num_positive_points=num_pos_points,
+            num_negative_points=num_neg_points,
             num_prompts_per_class=num_prompts_per_class,
             point_sampling_strategy="center_weighted",
             box_noise_level=0.1,
             generate_box=True,
-            generate_points=True
+            generate_points=True,
+            is_strict=args.is_strict
         )
         
         decoded_mask = prompts['decoded_mask']
@@ -371,11 +431,10 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
         # 1. 获取当前模型预测
         with torch.enable_grad():  # 确保启用梯度
             results = get_prompt_preds(
-                model, prompts, prompt_mode='both', 
+                model, prompts, prompt_mode=args.prompt_type,     
                 multimask_output=True, 
                 only_best_score_pred=True, 
                 only_save_best_prompt_pred=False,
-                # return_logits=True  # 返回logits
             )
             
             current_logits, current_scores, current_category_indices = concatenate_masks_and_scores_v2(
@@ -384,8 +443,29 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
         
         # 2. 获取参考模型预测 (无梯度)
         with torch.no_grad():
+            if args.kl_pos_point_num is not False and args.kl_neg_point_num is not False:
+                if isinstance(args.kl_pos_point_num, tuple):
+                    kl_num_pos_points = np.random.randint(*args.kl_pos_point_num, size=(1))[0]
+                else: kl_num_pos_points = args.kl_pos_point_num
+                if isinstance(args.kl_neg_point_num, tuple):
+                    kl_num_neg_points = np.random.randint(*args.kl_neg_point_num, size=(1))[0]
+                else: kl_num_neg_points = args.kl_neg_point_num
+                prompts = generate_prompts_from_semantic_mask(
+                    label,
+                    class_ids=None,
+                    num_positive_points=kl_num_pos_points,
+                    num_negative_points=kl_num_neg_points,
+                    num_prompts_per_class=num_prompts_per_class,
+                    point_sampling_strategy="center_weighted",
+                    box_noise_level=0.01,
+                    generate_box=True,
+                    generate_points=True,
+                    is_strict=args.kl_is_strict
+                )
+            else: pass
+
             ref_results = get_prompt_preds(
-                ref_model, prompts, prompt_mode='both', 
+                ref_model, prompts, prompt_mode=args.kl_prompt_type, 
                 multimask_output=True, 
                 only_best_score_pred=True, 
                 only_save_best_prompt_pred=False,
@@ -405,7 +485,15 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
             # rewards = continuous_to_dispersed(compute_reward(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class)).flatten()
             rewards1 = continuous_to_dispersed_v2(compute_reward(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class), scheme=1)
             rewards2 = continuous_to_dispersed_v2(compute_reward(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class), scheme=2)
-            rewards = (rewards1 + rewards2).flatten()
+            
+            if args.rw_func == 'f1':
+                rewards = rewards1.flatten()
+            elif args.rw_func == 'f2':
+                rewards = rewards2.flatten()
+            elif args.rw_func == 'all':
+                rewards = (rewards1 + rewards2).flatten()
+            else:
+                raise NotImplementedError
 
             log_structured_rewards_stats(rewards1, num_prompts_per_class, step=image_idx_in_all_trainset, logger=writer, class_keys=class_keys, name='rewards1')
             log_structured_rewards_stats(rewards2, num_prompts_per_class, step=image_idx_in_all_trainset, logger=writer, class_keys=class_keys, name='rewards2')
@@ -417,7 +505,7 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
             cls_weights = torch.softmax(
                 1 / normalize_in_chunks(
                     compute_reward(adaptive_pool(current_logits), decoded_mask.float()), 
-                    chunk_size=num_prompts_per_class, temperature=2).reshape(-1, 3).max(dim=1)[0] / args.weight_temp, 
+                    chunk_size=num_prompts_per_class, temperature=2).reshape(-1, num_prompts_per_class).max(dim=1)[0] / args.weight_temp, 
                 dim=0)
             cls_weights = cls_weights[None].repeat(num_prompts_per_class, 1).transpose(0, 1).flatten().cuda()
 
@@ -481,6 +569,304 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
         return total_loss.item(), avg_reward
     
     return 0, 0
+
+
+def read_single(img=np.random.randint(0, 255, size=(512, 512, 3)), lab=np.random.randint(0, 8, size=(512, 512)), target_size=512): # read random image and its annotaion from  the dataset (LabPics)
+        Img = img
+        ann_map = lab
+
+        r = np.min([target_size / Img.shape[1], target_size / Img.shape[0]]) # scalling factor
+        Img = cv2.resize(Img, (int(Img.shape[1] * r), int(Img.shape[0] * r)))
+        mat_map = cv2.resize(ann_map, (int(ann_map.shape[1] * r), int(ann_map.shape[0] * r)),interpolation=cv2.INTER_NEAREST)
+
+        inds = np.unique(mat_map)[1:] # load all indices
+        points= []
+        masks = []
+        for ind in inds:
+            mask=(mat_map == ind).astype(np.uint8) # make binary mask corresponding to index ind
+            masks.append(mask)
+            coords = np.argwhere(mask > 0) # get all coordinates in mask
+            yx = np.array(coords[np.random.randint(len(coords))]) # choose random point/coordinate
+            points.append([[yx[1], yx[0]]])
+        return Img, np.array(masks), np.array(points), np.ones([len(masks),1])
+
+
+def read_batch_single_v1(img=np.random.randint(0, 255, size=(512, 512, 3)), lab=np.random.randint(0, 8, size=(512, 512)), target_size=512): # read random image and single mask from  the dataset (LabPics)
+    Img = img
+    ann_map = lab
+
+    r = np.min([target_size / Img.shape[1], target_size / Img.shape[0]]) # scalling factor
+    Img = cv2.resize(Img, (int(Img.shape[1] * r), int(Img.shape[0] * r)))
+    ann_map = cv2.resize(ann_map, (int(ann_map.shape[1] * r), int(ann_map.shape[0] * r)), interpolation=cv2.INTER_NEAREST)
+
+    inds = np.unique(ann_map)[1:] # load all indices
+    if inds.__len__()>0:
+            ind = inds[np.random.randint(inds.__len__())]  # pick single segment
+    else:
+            return None  # return read_batch_single(data)
+
+    mask = (ann_map == ind).astype(np.uint8) # make binary mask corresponding to index ind
+    coords = np.argwhere(mask > 0) # get all coordinates in mask
+    yx = np.array(coords[np.random.randint(len(coords))]) # choose random point/coordinate
+    return Img, mask, [[yx[1], yx[0]]]
+
+
+def read_batch_single_v2(img=np.random.randint(0, 255, size=(512, 512, 3)), lab=np.random.randint(0, 8, size=(512, 512)), target_size=512, num_pos_points=1, num_neg_points=0):
+    """
+    读取并处理单个图像和分割掩码, 提取正负样本点和边界框
+    
+    参数:
+        img: 输入图像, 默认为随机生成的RGB图像
+        lab: 分割标签图, 默认为随机生成的标签图
+        target_size: 目标尺寸, 默认为512
+        num_pos_points: 负样本点的数量, 默认为1
+        num_neg_points: 负样本点的数量, 默认为0
+    
+    返回:
+        Img: 调整大小后的图像
+        mask: 选定分割区域的二值掩码
+        pos_points: 正样本点坐标列表 [[x,y]]
+        neg_points: 负样本点坐标列表 [[x1,y1], [x2,y2], ...]
+        bbox: 分割区域的边界框 [x_min, y_min, x_max, y_max]
+    """
+    Img = img
+    ann_map = lab
+
+    r = np.min([target_size / Img.shape[1], target_size / Img.shape[0]])
+    Img = cv2.resize(Img, (int(Img.shape[1] * r), int(Img.shape[0] * r)))
+    ann_map = cv2.resize(ann_map, (int(ann_map.shape[1] * r), int(ann_map.shape[0] * r)), interpolation=cv2.INTER_NEAREST)
+
+    # 获取所有非背景标签
+    inds = np.unique(ann_map)[1:]
+    if inds.__len__() > 0:
+        ind = inds[np.random.randint(inds.__len__())]  # 随机选择一个分割区域
+    else:
+        return None  # 如果没有分割区域, 返回None
+
+    # 创建二值掩码
+    mask = (ann_map == ind).astype(np.uint8)
+    
+    # 提取正样本点
+    coords = np.argwhere(mask > 0)
+    if len(coords) == 0:
+        return None  # 如果掩码为空, 返回None
+
+    pos_points = []
+    pos_indices = np.random.choice(len(coords), min(num_pos_points, len(coords)), replace=False)
+    for idx in pos_indices:
+        ny, nx = coords[idx]
+        pos_points.append([nx, ny])  # 转换为[x,y]格式
+    
+    # 提取负样本点
+    neg_mask = (mask == 0).astype(np.uint8)  # 掩码外的区域
+    neg_coords = np.argwhere(neg_mask > 0)
+    
+    neg_points = []
+    if len(neg_coords) > 0:
+        # 随机选择指定数量的负样本点
+        neg_indices = np.random.choice(len(neg_coords), min(num_neg_points, len(neg_coords)), replace=False)
+        for idx in neg_indices:
+            ny, nx = neg_coords[idx]
+            neg_points.append([nx, ny])  # 转换为[x,y]格式
+    
+    if len(coords) > 0:
+        y_min, x_min = coords.min(axis=0)
+        y_max, x_max = coords.max(axis=0)
+        bbox = [x_min, y_min, x_max, y_max]  # [x_min, y_min, x_max, y_max]格式
+    else:
+        bbox = [0, 0, 0, 0]
+    
+    return Img, mask, pos_points, neg_points, bbox
+
+
+def read_batch(imgs=np.random.randint(0, 255, (16, 3, 512, 512)), labs=np.random.randint(0, 255, (16, 512, 512)), target_size=512, num_pos_points=1, num_neg_points=0):
+    limage = []
+    lmask = []
+    linput_pos_point = []
+    linput_neg_point = []
+    linput_box = []
+    for i in range(len(imgs)):
+        img = np.transpose(imgs[i], (1, 2, 0))
+        lab = labs[i]
+        read_return = read_batch_single_v2(img, lab, target_size, num_pos_points=num_pos_points, num_neg_points=num_neg_points)
+        if read_return is not None:
+            image, mask, input_pos_point, input_neg_point, input_box = read_return
+        else:
+            continue
+        limage.append(image)
+        lmask.append(mask)
+        linput_pos_point.append(input_pos_point)
+        linput_neg_point.append(input_neg_point) if num_neg_points != 0 else []
+        linput_box.append(input_box)
+    
+    if len(limage) != 0:
+        return limage, np.array(lmask), np.array(linput_pos_point), np.array(linput_neg_point), np.array(linput_box), np.ones([len(limage),1])
+    else:
+        return None
+
+
+def train_with_seg_single(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, beta=0.05, clip_param=0.2, iteration=0, writer=None, args=False):
+    if not hasattr(train_with_grpo, 'ref_model'):
+        train_with_grpo.ref_model = create_reference_model(model)
+    ref_model = train_with_grpo.ref_model
+
+    if label_batch.sum() == 0:
+        return 0, 0
+    
+    batch_losses = []
+    
+    for idx, (image_idx, label_idx) in enumerate(zip(range(image_batch.shape[0]), range(label_batch.shape[0]))):
+        image_idx_in_all_trainset = iteration*image_batch.shape[0]+idx
+        image, label = image_batch[image_idx].permute(1, 2, 0).cpu().numpy(), label_batch[label_idx].cpu().numpy()
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16): # cast to mix precision
+            image, mask, input_point, input_label = read_single(image, label)
+            model.set_image(image) # apply SAM image encoder to the image
+            
+            if label.mean() == 0:
+                continue
+
+            mask_input, unnorm_coords, labels, unnorm_box = model._prep_prompts(input_point, input_label, box=None, mask_logits=None, normalize_coords=True)
+            sparse_embeddings, dense_embeddings = model.model.sam_prompt_encoder(points=(unnorm_coords, labels),boxes=None,masks=None,)
+
+            batched_mode = unnorm_coords.shape[0] > 1 # multi object prediction
+            high_res_features = [feat_level[-1].unsqueeze(0) for feat_level in model._features["high_res_feats"]]
+            low_res_masks, prd_scores, _, _ = model.model.sam_mask_decoder(image_embeddings=model._features["image_embed"][-1].unsqueeze(0),
+                                                                            image_pe=model.model.sam_prompt_encoder.get_dense_pe(),
+                                                                            sparse_prompt_embeddings=sparse_embeddings,
+                                                                            dense_prompt_embeddings=dense_embeddings,
+                                                                            multimask_output=True,
+                                                                            repeat_image=batched_mode,
+                                                                            high_res_features=high_res_features,)
+            prd_masks = model._transforms.postprocess_masks(low_res_masks, model._orig_hw[-1])# Upscale the masks to the original image resolution
+
+            gt_mask = torch.tensor(mask.astype(np.float32)).cuda()
+            prd_mask = torch.sigmoid(prd_masks[:, 0])# Turn logit map to probability map
+
+            # plt.imshow(gt_mask.permute(1, 2, 0).cpu().numpy().sum(axis=2)); plt.show()
+            # plt.imshow(prd_mask.permute(1, 2, 0).detach().cpu().numpy().sum(axis=2)); plt.show()
+
+            seg_loss = (-gt_mask * torch.log(prd_mask + 0.00001) - (1 - gt_mask) * torch.log((1 - prd_mask) + 0.00001)).mean() # cross entropy loss
+
+            inter = (gt_mask * (prd_mask > 0.5)).sum(1).sum(1)
+            iou = inter / (gt_mask.sum(1).sum(1) + (prd_mask > 0.5).sum(1).sum(1) - inter)
+            score_loss = torch.abs(prd_scores[:, 0] - iou).mean()
+            loss = seg_loss + score_loss * 0.05  # mix losses
+
+            model.model.zero_grad() # empty gradient
+            scaler.scale(loss).backward()  # Backpropogate
+            scaler.step(optimizer)
+            scaler.update() # Mix precision
+
+            if image_idx_in_all_trainset % 1000==0: torch.save(model.model.state_dict(), "model.torch");print("save model")
+
+            if image_idx_in_all_trainset == 0: mean_iou = 0
+            mean_iou = mean_iou * 0.99 + 0.01 * np.mean(iou.cpu().detach().numpy())
+            print("step)",image_idx_in_all_trainset, "Accuracy(IOU)=",mean_iou)
+            batch_losses.append(loss)
+            writer.add_scalar('detail/loss', loss.cpu().item(), image_idx_in_all_trainset)
+            writer.add_scalar('detail/mean_iou', mean_iou, image_idx_in_all_trainset)
+
+    if batch_losses:
+        total_loss = torch.stack(batch_losses).mean()
+        
+        return total_loss.item(), 0
+    
+    return 0, 0
+
+
+def train_with_seg_batch(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, beta=0.05, clip_param=0.2, iteration=0, writer=None, args=False):
+    if not hasattr(train_with_grpo, 'ref_model'):
+        train_with_grpo.ref_model = create_reference_model(model)
+    ref_model = train_with_grpo.ref_model
+
+    if label_batch.sum() == 0:
+        return 0, 0
+    
+    if isinstance(args.pos_point_num, tuple):
+        num_pos_points = np.random.randint(*args.pos_point_num, size=(1))
+    else: num_pos_points = args.pos_point_num
+    if isinstance(args.neg_point_num, tuple):
+        num_neg_points = np.random.randint(*args.neg_point_num, size=(1))
+    else: num_neg_points = args.neg_point_num
+
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16): # cast to mix precision
+        read_batch_return = read_batch(image_batch.cpu().numpy(), label_batch.cpu().numpy(), target_size=label_batch.shape[-1], 
+                                       num_pos_points=num_pos_points, num_neg_points=num_neg_points)
+        if read_batch_return is None:
+            return 0, 0
+        else:
+            image, mask, input_point, input_neg_point, input_box, input_label = read_batch_return
+        
+        if len(input_neg_point) != 0:
+            input_point = np.concatenate([input_point, input_neg_point], axis=1)
+            input_label = np.concatenate([input_label, np.zeros((input_label.shape[0], input_neg_point.shape[1]))], axis=1)
+
+        model.set_image_batch(image) # apply SAM image encoder to the image
+
+        if args.prompt_type == 'point':
+            mask_input, unnorm_coords, labels, unnorm_box = model._prep_prompts(input_point, input_label, box=None, mask_logits=None, normalize_coords=True)
+        elif args.prompt_type == 'box':
+            mask_input, unnorm_coords, labels, unnorm_box = model._prep_prompts(None, None, box=input_box, mask_logits=None, normalize_coords=True)
+        elif args.prompt_type == 'both':
+            mask_input, unnorm_coords, labels, unnorm_box = model._prep_prompts(input_point, input_label, box=input_box, mask_logits=None, normalize_coords=True)
+        else: raise ValueError
+        
+        if unnorm_coords is not None:
+            concat_points = (unnorm_coords, labels)
+        else:
+            concat_points = None
+
+        if unnorm_box is not None:
+            box_coords = unnorm_box.reshape(-1, 2, 2)
+            box_labels = torch.tensor([[2, 3]], dtype=torch.int, device='cuda')
+            box_labels = box_labels.repeat(unnorm_box.size(0), 1)
+            if concat_points is not None:
+                concat_coords = torch.cat([box_coords, concat_points[0]], dim=1)
+                concat_labels = torch.cat([box_labels, concat_points[1]], dim=1)
+                concat_points = (concat_coords, concat_labels)
+            else:
+                concat_points = (box_coords, box_labels)
+        sparse_embeddings, dense_embeddings = model.model.sam_prompt_encoder(points=(unnorm_coords, labels), boxes=None, masks=None,)
+
+        high_res_features = [feat_level[-1].unsqueeze(0) for feat_level in model._features["high_res_feats"]]
+        low_res_masks, prd_scores, _, _ = model.model.sam_mask_decoder(image_embeddings=model._features["image_embed"],
+                                                                        image_pe=model.model.sam_prompt_encoder.get_dense_pe(),
+                                                                        sparse_prompt_embeddings=sparse_embeddings,
+                                                                        dense_prompt_embeddings=dense_embeddings,
+                                                                        multimask_output=True,
+                                                                        repeat_image=False,
+                                                                        high_res_features=high_res_features)
+        prd_masks = model._transforms.postprocess_masks(low_res_masks, model._orig_hw[-1])# Upscale the masks to the original image resolution
+
+        gt_mask = torch.tensor(mask.astype(np.float32)).cuda()
+        multimask_len = prd_masks.shape[1]
+        multimask_idx = 0   # Todo: 这个要怎么使用呢？
+        prd_mask = torch.sigmoid(prd_masks[:, multimask_idx])# Turn logit map to probability map    # 为什么这是第一个索引
+        seg_loss = (-gt_mask * torch.log(prd_mask + 0.00001) - (1 - gt_mask) * torch.log((1 - prd_mask) + 0.00001)).mean() # cross entropy loss
+
+        inter = (gt_mask * (prd_mask > 0.5)).sum(1).sum(1)
+        iou = inter / (gt_mask.sum(1).sum(1) + (prd_mask > 0.5).sum(1).sum(1) - inter)
+        score_loss = torch.abs(prd_scores[:, multimask_idx] - iou).mean()
+        loss = seg_loss + score_loss * 0.05  # mix losses
+
+        model.model.zero_grad() # empty gradient
+        scaler.scale(loss).backward()  # Backpropogate
+        scaler.step(optimizer)
+        scaler.update() # Mix precision
+
+        # if iteration % 1000==0: torch.save(model.model.state_dict(), "model.torch");print("save model")
+        if iteration == 0: args.mean_iou = 0
+        args.mean_iou = args.mean_iou * 0.99 + 0.01 * np.mean(iou.cpu().detach().numpy())
+        writer.add_scalar('detail/loss', loss.cpu().item(), iteration)
+        writer.add_scalar('detail/mean_iou', args.mean_iou, iteration)
+        print("step)",iteration, "Accuracy(IOU)=", args.mean_iou)
+
+    return loss.item(), 0
+
+
+def val_with_seg_batch():
+    pass
 
 
 def grpo_loss_v2(current_logits, ref_logits, pred_binary, gen_logits, rewards, beta=0.05, clip_param=0.2, gen_probs=None, num_prompts_per_class=3, rw_temp=1):
@@ -656,10 +1042,13 @@ def dpo_loss_segmentation(policy_logits, ref_logits, gt_masks, rewards, beta=0.0
     # 3. DPO Loss (像素级别)
     loss = -F.logsigmoid(beta * logits)
 
-    sample_loss = criterion(policy_chosen_logps, gt_masks.float().cuda()[torch.argmax(rewards, dim=1)])
+    sample_loss_choosen = criterion(policy_chosen_logps, gt_masks.float().cuda()[torch.argmax(rewards, dim=1)])
+    sample_loss_rejected = criterion(policy_rejected_logps, gt_masks.float().cuda()[torch.argmin(rewards, dim=1)])
+    sample_loss = sample_loss_choosen + sample_loss_rejected * 0.3
 
     loss = loss.mean() + sample_loss
     return loss, sample_loss
+
 
 # part of grpo_loss_v3
 def f1_score(pred_mask, gt_mask, smooth=1e-6):

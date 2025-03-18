@@ -21,6 +21,13 @@ from icecream import ic
 
 import shutil
 
+def parse_str(s):
+    if isinstance(s, bool): return s
+    try:
+        return int(s)
+    except:
+        return eval(s)
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
                     default='/data2/zhcheng/train_npz_224', help='root dir for data')
@@ -36,8 +43,6 @@ parser.add_argument('--num_classes', type=int,
 parser.add_argument('--max_iterations', type=int,
                     default=30000, help='maximum epoch number to train')
 parser.add_argument('--max_epochs', type=int,
-                    default=300, help='maximum epoch number to train')
-parser.add_argument('--stop_epoch', type=int,
                     default=300, help='maximum epoch number to train')
 parser.add_argument('--batch_size', type=int,
                     default=24, help='batch_size per gpu')
@@ -69,19 +74,34 @@ parser.add_argument('--num_workers', type=int, default=8, help='number of worker
 parser.add_argument('--interval_epoch', type=int, default=50, help='interval epoch for saving')
 
 parser.add_argument('--model', type=str, default='sam2', choices=['hsam', 'sam2'], help='模型选择')
+parser.add_argument('--prompt_type', type=str, default='point', choices=['point', 'box', 'both'], help='prompt 类型')
+parser.add_argument('--is_strict', action='store_true', help='是否要求 point 在 box 内')
+parser.add_argument('--pos_point_num', type=parse_str, default='1', help='')    # note: 目前只在 train_with_seg_batch 中 使用
+parser.add_argument('--neg_point_num', type=parse_str, default='0', help='')
+
+parser.add_argument('--kl_prompt_type', type=str, default='box', choices=['point', 'box', 'both'], help='教师模型的 prompt 类型')
+parser.add_argument('--kl_is_strict', action='store_true', help='是否要求 point 在 box 内')
+parser.add_argument('--kl_pos_point_num', type=parse_str, default=False, help='')    # note: 目前只在 train_with_seg_batch 中 使用
+parser.add_argument('--kl_neg_point_num', type=parse_str, default=False, help='')
+
 parser.add_argument('--is_grpo', action='store_true', help='是否使用grPO优化')
-parser.add_argument('--is_dpo', action='store_true', help='是否使用DPO优化')
 parser.add_argument('--rw_dispered', action='store_true', help='是否使用离散的奖励机制')
+parser.add_argument('--rw_func', type=str, default='all', choices=['f1', 'f2', 'all'], help='离散的奖励函数类型')
 parser.add_argument('--rw_temp', type=float, default=1., help='奖励的温度')
 parser.add_argument('--grpo_KL_weight', action='store_true', help='')
 parser.add_argument('--weight_temp', type=float, default=1., help='在grpo中使用权重进行调节KL的惩罚力度, 温度越小则惩罚越大(类别之间的惩罚力度差距会变大)')
+
+parser.add_argument('--is_dpo', action='store_true', help='是否使用DPO优化')
+parser.add_argument('--dev', action='store_true', help='开发版')
 
 parser.add_argument('--num_prompts_per_class', type=int, default=3, help='对于一张图像, 会采样出多少个prompt, 等于GRPO组的大小')
 parser.add_argument('--kl_beta', type=float, default=0.05, help='调控KL散度')
 parser.add_argument('--ours_use_lora', action='store_true', help='我们的方法是否使用lora')
 
 # parser.add_argument('--mixed_precision', type=str, default='no', choices=['no', 'fp16', 'bf16'], help='混合精度训练类型: no=禁用, fp16=float16, bf16=bfloat16')
-parser.add_argument('--precision', type=str, default='float32', choices=['float32', 'float16', 'bfloat16'], help='训练精度: float32=全精度, float16=半精度, bfloat16=BF16精度')
+parser.add_argument('--precision', type=str, default='bfloat16', choices=['float32', 'float16', 'bfloat16'], help='训练精度: float32=全精度, float16=半精度, bfloat16=BF16精度')
+parser.add_argument('--exp_series', type=str, default='EXPS1', help='实验系列名称')
+parser.add_argument('--exp_name', type=str, default='exp1', help='实验名称')
 parser.add_argument('--desc', type=str, default='none', help='实验说明')
 args = parser.parse_args()
 
@@ -90,11 +110,12 @@ if args.debug:
     args.n_gpu = int(torch.cuda.device_count())
     if args.model == 'sam2':
         args.root_path = '/new_wyh/Synapse-multi-organ-CT-dataset/train_npz_new_224_with_foreground/'
-        args.is_grpo = True
-        args.rw_dispered = False
-        args.rw_temp = 3
-        args.grpo_KL_weight = True
-        args.weight_temp = 0.5
+        # args.is_grpo = True
+        # args.rw_dispered = False
+        # args.rw_temp = 3
+        # args.grpo_KL_weight = True
+        # args.weight_temp = 0.5
+        args.dev = True
     elif args.model == 'hsam':
         args.root_path = '/new_wyh/Synapse-multi-organ-CT-dataset/train_npz_new_224/'
     args.split = 'train'
@@ -104,7 +125,6 @@ if args.debug:
     args.warmup = True
     args.AdamW = True
     args.max_epochs = 300
-    args.stop_epoch = 300
     args.vit_name = 'vit_b'
     args.num_workers = 0
     args.ckpt = 'checkpoints/sam_vit_b_01ec64.pth'
@@ -141,9 +161,11 @@ if __name__ == "__main__":
         po_type = 'grpo_dispered' if args.rw_dispered else 'grpo'
     elif args.is_dpo:
         po_type = 'dpo'
+    elif args.dev:
+        po_type = 'dev'
     else:
         po_type = 'nopo'
-    snapshot_path = os.path.join(args.output, args.model, f"{po_type}", "{}_{}".format(current_time, args.exp))
+    snapshot_path = os.path.join(args.output, args.exp_series, args.exp_name, f"{args.model}-{po_type}", "{}_{}".format(current_time, args.exp))
     snapshot_path = snapshot_path + '_pretrain' if args.is_pretrain else snapshot_path
     snapshot_path += '_' + args.vit_name
     snapshot_path = snapshot_path + '_' + str(args.max_iterations)[
@@ -153,6 +175,7 @@ if __name__ == "__main__":
     snapshot_path = snapshot_path + '_lr' + str(args.base_lr) if args.base_lr != 0.01 else snapshot_path
     snapshot_path = snapshot_path + '_s' + str(args.seed) if args.seed != 1234 else snapshot_path
 
+    if args.debug: snapshot_path = '/database/wuyonghuang/hsam_code/output/debug'
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
 

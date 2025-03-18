@@ -1,4 +1,5 @@
 import os
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 import sys
 import pytz, datetime
 from tqdm import tqdm
@@ -37,7 +38,6 @@ def inference(args, multimask_output, db_config, model, test_save_path=None, sav
         metric_list += np.array(metric_i)
         print('idx %d case %s mean_dice %f mean_hd95 %f' % (
             i_batch, case_name, np.mean(metric_i, axis=0)[0], np.mean(metric_i, axis=0)[1]))
-        # break
     metric_list = metric_list / len(db_test)
     for i in range(1, args.num_classes + 1):
         try:
@@ -59,6 +59,13 @@ def config_to_dict(config):
         key, value = items[i].strip().split(': ')
         items_dict[key] = value
     return items_dict
+
+
+def parse_str(s):
+    try:
+        return int(s)
+    except:
+        return eval(s)
 
 
 if __name__ == '__main__':
@@ -85,16 +92,21 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='hsam', choices=['hsam', 'sam2'], help='模型选择')
     parser.add_argument('--prompt_type', type=str, default='point', help='point、box、both')
     parser.add_argument('--point_strict', action='store_true', help='')
+    parser.add_argument('--pos_point_num', type=parse_str, default='1', help='')
+    parser.add_argument('--neg_point_num', type=parse_str, default='0', help='')
+
+    parser.add_argument('--num_prompts_per_class', type=int, default=1, help='对于一张图像, 会采样出多少个prompt, 等于GRPO组的大小; 区别于 train, 这里设置为 1')
+
     parser.add_argument('--debug', '-d', action='store_true', help='If activated, debug mode is activated')
 
     args = parser.parse_args()
 
     if args.debug:
-        args.lora_ckpt = None# '/database/wuyonghuang/hsam_code/220_epoch_299.pth'
+        args.lora_ckpt = None   # '/database/wuyonghuang/hsam_code/220_epoch_299.pth'
         args.vit_name = 'vit_b'
-        args.ckpt = None# 'checkpoints/sam_vit_b_01ec64.pth'
+        args.ckpt = '/database/wuyonghuang/hsam_code/output/EXPS1/exp1/sam2-dpo/20250317_175612_Synapse_224_pretrain_vit_b_epo20_bs8_lr0.0001_s2345/epoch_000_loss-0.0359201457661887_iou-0.6986421409994364.pth' # 'checkpoints/sam_vit_b_01ec64.pth'
         args.stage = 3
-        args.img_size = 512
+        args.img_size = 224
         args.model = 'sam2'
 
     if args.config is not None:
@@ -149,7 +161,10 @@ if __name__ == '__main__':
             ckpt_name = os.path.basename(args.ckpt)
         else:
             ckpt_name = 'noneckpt'
-        args.output_dir = os.path.join(args.output_dir, f"{args.model}", f"{current_time}-{args.vit_name}-{ckpt_name}")
+        if args.debug:
+            args.output_dir = os.path.join(args.output_dir, f"debug")
+        else:
+            args.output_dir = os.path.join(args.output_dir, f"{args.model}", f"{current_time}-{args.vit_name}-{ckpt_name}")
 
         # 需要进入sam2-main文件夹下, 然后 pip install -e .; 或者按照官网的教程安装
         # 使用: /database/wuyonghuang/hsam_code/sam2-main/test.ipynb
