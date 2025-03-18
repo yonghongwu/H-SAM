@@ -14,6 +14,7 @@ from tqdm import tqdm
 from skimage.metrics import adapted_rand_error
 from scipy.spatial.distance import cdist
 from scipy.ndimage.interpolation import zoom
+from gen_prompt import generate_prompts_from_semantic_mask, get_prompt_preds, concatenate_masks_and_scores_v2, plot_results
 
 def dice_coefficient(mask1, mask2):
     # Convert masks to boolean arrays
@@ -51,10 +52,23 @@ def hd95(mask1, mask2):
     sorted_distances = np.sort(all_min_distances)
     
     # Compute the 85th percentile of the sorted distances
-    hd85_value = np.percentile(sorted_distances, 95)
+    hd95_value = np.percentile(sorted_distances, 95)
     
-    return hd85_value
+    return hd95_value
 
+from medpy.metric import binary
+# 或
+from surface_distance import compute_robust_hausdorff
+
+def hd95(result, reference):
+    try:
+        if np.sum(result) > 0 and np.sum(reference) > 0:
+            return binary.hd95(result, reference)
+        else:
+            return np.nan  # 或其他适当的值
+    except Exception as e:
+        print(f"HD95计算错误: {e}")
+        return np.nan
 
 class Focal_loss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2, num_classes=3, size_average=True):
@@ -226,25 +240,27 @@ def calculate_metric_percase(pred, gt):
 
 def test_single_volume(image, label, net, classes, multimask_output, patch_size=[256, 256], input_size=[224, 224],
                        test_save_path=None, case=None, z_spacing=1, stage=2, mode='test', model='hsam', save_nii=False, args=None):
+    num_prompts_per_class = 1
     lab = label.squeeze(0)
     image, label = image.squeeze(0).cpu().detach().numpy(), label.squeeze(0).cpu().detach().numpy()
     if len(image.shape) == 3:
         prediction = np.zeros_like(label)
         dice_lst, hd95_lst = [], []
         for ind in tqdm(range(image.shape[0])):
-            slice = image[ind, :, :]
-            l = lab[ind, :, :]
-            x, y = slice.shape[0], slice.shape[1]
-            if x != input_size[0] or y != input_size[1]:
-                slice = zoom(slice, (input_size[0] / x, input_size[1] / y), order=3)  # previous using 0
-            new_x, new_y = slice.shape[0], slice.shape[1]  # [input_size[0], input_size[1]]
-            if new_x != patch_size[0] or new_y != patch_size[1]:
-                slice = zoom(slice, (patch_size[0] / new_x, patch_size[1] / new_y), order=3)  # previous using 0, patch_size[0], patch_size[1]
-            inputs = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().cuda()
-            inputs = repeat(inputs, 'b c h w -> b (repeat c) h w', repeat=3)
             with torch.no_grad():
                 if model == 'hsam':
+                    slice = image[ind, :, :]
+                    l = lab[ind, :, :]
+                    x, y = slice.shape[0], slice.shape[1]
+                    if x != input_size[0] or y != input_size[1]:
+                        slice = zoom(slice, (input_size[0] / x, input_size[1] / y), order=3)  # previous using 0
+                    new_x, new_y = slice.shape[0], slice.shape[1]  # [input_size[0], input_size[1]]
+                    if new_x != patch_size[0] or new_y != patch_size[1]:
+                        slice = zoom(slice, (patch_size[0] / new_x, patch_size[1] / new_y), order=3)  # previous using 0, patch_size[0], patch_size[1]
+                    inputs = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().cuda()
+                    inputs = repeat(inputs, 'b c h w -> b (repeat c) h w', repeat=3)
                     net.eval()
+
                     outputs1,outputs2,_,_ = net(inputs, multimask_output, patch_size[0], gt=None, mode='test')
                     if stage == 3:
                         output_masks = (outputs1['masks'] + outputs2['masks'])/2
@@ -254,23 +270,44 @@ def test_single_volume(image, label, net, classes, multimask_output, patch_size=
                     out = torch.argmax(torch.softmax(output_masks, dim=1), dim=1).squeeze(0)
                     out = out.cpu().detach().numpy()
                     out_h, out_w = out.shape
+
+                    if x != out_h or y != out_w:
+                        pred = zoom(out, (x / out_h, y / out_w), order=0)
+                    else:
+                        pred = out
+
                 elif model == 'sam2':
-                    # out = np.random.randn(224, 224)
-                    from gen_prompt import generate_prompts_from_semantic_mask, get_prompt_preds, concatenate_masks_and_scores_v2, plot_results
                     net.model.eval()
-                    idx_image, idx_label = inputs[0].permute(1, 2, 0).cpu().numpy(), label[ind]   # low_res_label_batch[0].cpu().numpy()
+                    adaptive_pool = nn.AdaptiveAvgPool2d(input_size)
+                    slice = image[ind, :, :]
+                    x, y = slice.shape[0], slice.shape[1]
+                    if x != input_size[0] or y != input_size[1]:
+                        slice = zoom(slice, (input_size[0] / x, input_size[1] / y), order=3)
+                    
+                    lab_slice = label[ind].astype(np.uint8)
+                    x_lab, y_lab = lab_slice.shape[0], lab_slice.shape[1]
+                    if x_lab != input_size[0] or y_lab != input_size[1]:
+                        lab_slice = zoom(lab_slice, (input_size[0] / x_lab, input_size[1] / y_lab), order=0)    # 使用最近邻算法而不是插值
+                    idx_image, idx_label = repeat(slice[..., None], 'h w c -> h w (repeat c)', repeat=3), lab_slice   # low_res_label_batch[0].cpu().numpy()
 
                     if idx_label.mean() == 0: 
                         # print("无前景; Skip")
                         continue
 
+                    if isinstance(args.pos_point_num, tuple):
+                        num_pos_points = np.random.randint(*args.pos_point_num, size=(1))[0]
+                    else: num_pos_points = args.pos_point_num
+                    if isinstance(args.neg_point_num, tuple):
+                        num_neg_points = np.random.randint(*args.neg_point_num, size=(1))[0]
+                    else: num_neg_points = args.neg_point_num
+
                     # 获取 prompts、二值化的多类别掩码
                     prompts = generate_prompts_from_semantic_mask(
                         idx_label,
                         class_ids=None,  # 处理所有类别
-                        num_positive_points=1,
-                        num_negative_points=(1, 3),
-                        num_prompts_per_class=3,  # 每个类别生成3组prompt
+                        num_positive_points=num_pos_points,  # 别人在测试的时候是怎么设置的？
+                        num_negative_points=num_neg_points,
+                        num_prompts_per_class=args.num_prompts_per_class,  # note: 为什么每个类别生成3组prompt, 测试时是不是只使用一个比较合理
                         point_sampling_strategy="center_weighted",
                         box_noise_level=0.1,
                         generate_box=True,
@@ -278,57 +315,39 @@ def test_single_volume(image, label, net, classes, multimask_output, patch_size=
                         is_strict=args.point_strict
                     )
 
-                    decoded_mask = prompts['decoded_mask']
-                    # 按照decoded_mask的键的顺序进行排序，然后将值重复三次再全部拼接起来。
-                    exist_keys = sorted(decoded_mask.keys())
-                    for key in exist_keys:
-                        # decoded_mask[key] = np.repeat(decoded_mask[key], 3, axis=0)
-                        decoded_mask[key] = torch.from_numpy(decoded_mask[key])[None].long().repeat(3, 1, 1)
-                    decoded_mask = torch.concat(list(decoded_mask.values()), dim=0)
-
-                    # 函数: 接受 image、point、model, 输出 prediction
+                    # # 按照decoded_mask的键的顺序进行排序，然后将值重复三次再全部拼接起来。
+                    decoded_mask = get_decoded_mask(prompts['decoded_mask'], num_prompts_per_class=num_prompts_per_class)
                     net.set_image(idx_image)
                     results = get_prompt_preds(net, prompts, prompt_mode=args.prompt_type, multimask_output=True, only_best_score_pred=True, only_save_best_prompt_pred=False)
-                    # all_masks, all_scores, category_indices = concatenate_masks_and_scores_v2(results['prompts_preds'], sort_keys=True)
+                    all_logits, all_scores, category_indices = concatenate_masks_and_scores_v2(results['prompts_preds'], sort_keys=True)
 
-                    cls_in_the_label = list(set(results.keys()) - set(['prompts_preds']))  # plt.imshow((results[7]['mask']>0).cpu().numpy()); plt.savefig('e.jpg')
-                    cls_preds_lst = []
-                    for cls_name in cls_in_the_label:
-                        idx_cls_prediction = (results[cls_name]['mask'].float() > 0)
-                        idx_cls_prediction = cls_name * idx_cls_prediction
-                        cls_preds_lst.append(idx_cls_prediction)
-                    pred = torch.stack(cls_preds_lst, dim=0).sum(dim=0)
-                    out = pred.cpu().numpy()
+                    criterion = nn.BCEWithLogitsLoss()
+                    adaptive_pool = nn.AdaptiveAvgPool2d(decoded_mask.shape[-2:])
+
+                    # sample_loss = criterion(adaptive_pool(all_logits), decoded_mask.float().cuda())
+                    # sample_iou = compute_iou(adaptive_pool(all_logits), decoded_mask.float().cuda())
+
+                    # 展示结果
+                    # plot_results(results, image, label, plot_prompts_preds=True, save_path_lst=None)
+                    out = np.zeros_like(idx_label, dtype=np.uint8) # size: (H, W)
+                    for idx, i in enumerate(sorted(set(np.unique(idx_label).astype(np.uint8)) - set([0]))):
+                        out += (adaptive_pool(all_logits) > 0).cpu().numpy().astype(np.uint8)[idx] * i
                     out_h, out_w = out.shape
+                    if x != out_h or y != out_w:
+                        pred = zoom(out, (x / out_h, y / out_w), order=0)
+                    else:
+                        pred = out
 
                     idx_label = zoom(idx_label, (out.shape[0] / idx_label.shape[0], out.shape[1] / idx_label.shape[1]), order=0)
-                    # idx_label = torch.from_numpy(idx_label.astype(np.float32))
-                    # idx_label = idx_label.long()
-                    gt = idx_label.astype(np.int64)  # 直接转为整数类型
-                    # gt = idx_label.cpu().numpy()
+                    gt = idx_label.astype(np.uint8)  # 直接转为整数类型
 
                     # 计算dice
-                    # mask1 = pred.cpu().numpy()
                     dice_score = dice_coefficient(out, gt)
-                    hd95_score = hd95(out, gt)
-                    print(f"idx_slide: {ind}, cls_in_the_label:{cls_in_the_label}, Dice Coefficient: {dice_score}, hd95_score: {hd95_score}")
+                    hd95_score = -1 # hd95(out, gt)
+                    print(f"idx_slide: {ind}, cls_in_the_label:{list(set(np.unique(label).astype(np.uint8)) - set([0]))}, Dice Coefficient: {dice_score}, hd95_score: {hd95_score}")
                     dice_lst.append(dice_score), hd95_lst.append(hd95_score)
 
-                if x != out_h or y != out_w:
-                    pred = zoom(out, (x / out_h, y / out_w), order=0)
-                else:
-                    pred = out
                 prediction[ind] = pred
-        # only for debug
-        # if not os.path.exists('/output/images/pred'):
-        #     os.makedirs('/output/images/pred')
-        # if not os.path.exists('/output/images/label'):
-        #     os.makedirs('/output/images/label')
-        # assert prediction.shape[0] == label.shape[0]
-        # for i in range(label.shape[0]):
-        #     imageio.imwrite(f'/output/images/pred/pred_{i}.png', prediction[i])
-        #     imageio.imwrite(f'/output/images/label/label_{i}.png', label[i])
-        # temp = input('kkpsa')
     else:
         x, y = image.shape[-2:]
         if x != patch_size[0] or y != patch_size[1]:
@@ -416,3 +435,13 @@ def mask_latent_code_spatial_wise(latent_code, loss, percentile=1 / 3.0, random=
 def set_grad(module, requires_grad=False):
     for p in module.parameters():  # reset requires_grad
         p.requires_grad = requires_grad
+
+
+def get_decoded_mask(decoded_mask, num_prompts_per_class):
+    # 按照decoded_mask的键的顺序进行排序, 然后将值重复三次再全部拼接起来。
+    exist_keys = sorted(decoded_mask.keys())
+    for key in exist_keys:
+        # decoded_mask[key] = np.repeat(decoded_mask[key], 3, axis=0)
+        decoded_mask[key] = torch.from_numpy(decoded_mask[key])[None].long().repeat(num_prompts_per_class, 1, 1)
+    decoded_mask = torch.concat(list(decoded_mask.values()), dim=0)
+    return decoded_mask

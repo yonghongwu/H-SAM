@@ -30,7 +30,7 @@ from batchgenerators.transforms.color_transforms import GammaTransform
 from batchgenerators.transforms.spatial_transforms import SpatialTransform, MirrorTransform
 from batchgenerators.transforms.utility_transforms import RemoveLabelTransform, RenameTransform, NumpyToTensor
 
-from opt_utils import vanilla_opt, train_with_grpo
+from opt_utils import vanilla_opt, train_with_grpo, train_with_seg_single, train_with_seg_batch, val_with_seg_batch, vanilla_eva
 
 def torch2D_Hausdorff_distance(x,y): # Input be like (Batch,width,height)
     x = x.float()
@@ -127,6 +127,7 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                                transform=transforms.Compose(
                                    [RandomGenerator(output_size=[args.img_size, args.img_size], low_res=[low_res, low_res])
                                    ]))
+    db_test = Synapse_dataset(base_dir='testset/test_vol_h5/', list_dir='./lists/lists_Synapse/', split='test_vol', transform=None)
     print("The length of train set is: {}".format(len(db_train)))
 
     def worker_init_fn(worker_id):
@@ -185,7 +186,6 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
     writer = SummaryWriter(snapshot_path + '/log')
     iter_num = 0
     max_epoch = args.max_epochs
-    stop_epoch = args.stop_epoch
     max_iterations = args.max_epochs * len(trainloader)  # max_epoch = max_iterations // len(trainloader) + 1
     tqdm.write("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
     best_performance = 0.0
@@ -227,7 +227,7 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             elif args.model == 'sam2':
                 dtype = None if args.precision == 'float32' else getattr(torch, args.precision) # 设置精度和上下文
                 amp_context = nullcontext() if dtype is None else torch.autocast(device_type="cuda", dtype=dtype)
-                scaler = torch.amp.GradScaler() if args.precision == 'float16' else None    # # 只有float16需要梯度缩放
+                scaler = torch.amp.GradScaler() if args.precision in ['float16', 'bfloat16'] else None    # # 只有float16需要梯度缩放
 
                 with amp_context:  # torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16)
                     # 对于不同的 prompt 导致的不同的预测结果, 计算出奖励, 然后使用 GRPO 进行优化: 奖励是由其他模型提供的, 那么怎么对本模型进行优化呢？
@@ -235,8 +235,11 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                     if args.is_grpo or args.is_dpo:
                         loss, _ = train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class,
                                                         beta=args.kl_beta, iteration=iter_num, writer=writer, args=args)
+                    elif args.dev:
+                        loss, _ = train_with_seg_batch(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class, 
+                                                       beta=args.kl_beta, iteration=iter_num, writer=writer, args=args)
                     else:
-                        loss, _ = vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class)
+                        loss, _ = vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class, args=args)
 
             if args.warmup and iter_num < args.warmup_period:
                 lr_ = base_lr * ((iter_num + 1) / args.warmup_period)
@@ -270,10 +273,24 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                 tqdm.write('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f, loss_ce2: %f, loss_dice2: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item(), loss_ce2.item(), loss_dice2.item()))
             else:
                 tqdm.write('iteration %d : loss : %f' % (iter_num, loss))
+            
+            if args.debug and i_batch == 0:
+                break
 
         save_interval = args.interval_epoch # int(max_epoch/6) Todo: 增加参数
-        if (epoch_num + 1) % save_interval == 0:
-            save_mode_path = os.path.join(snapshot_path, f'epoch_{epoch_num:03d}.pth')
+        if args.debug or (epoch_num + 1) % save_interval == 0:
+            infer_losses, infer_ious = [], []
+            for test_case in db_test:
+                images, labels, name = test_case['image'], test_case['label'], test_case['case_name']   # (slices, 512, 512), (slices, 512, 512), string
+                infer_loss, infer_iou = vanilla_eva(model, 
+                                                    torch.from_numpy(images.astype(np.float32)).unsqueeze(1).repeat(1, 3, 1, 1), 
+                                                    torch.from_numpy(labels), num_prompts_per_class=1, args=args)
+                infer_losses.append(infer_loss), infer_ious.append(infer_iou)
+            
+            writer.add_scalar('eva/infer_losses', np.mean(infer_losses), epoch_num)
+            writer.add_scalar('eva/infer_ious', np.mean(infer_ious), epoch_num)
+
+            save_mode_path = os.path.join(snapshot_path, f'epoch_{epoch_num:03d}-loss_{np.mean(infer_losses):.04f}-iou_{np.mean(infer_ious):.04f}.pth')
             if args.model == 'hsam':
                 try:
                     model.save_lora_parameters(save_mode_path)
@@ -286,7 +303,7 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                     torch.save(model.model.module.state_dict(), save_mode_path)
             tqdm.write("save model to {}".format(save_mode_path))
 
-        if epoch_num >= max_epoch - 1 or epoch_num >= stop_epoch - 1:
+        if args.debug or epoch_num >= max_epoch - 1:
             save_mode_path = os.path.join(snapshot_path, f'epoch_{epoch_num:03d}.pth')
             if args.model == 'hsam':
                 try:
