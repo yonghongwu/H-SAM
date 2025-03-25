@@ -92,6 +92,9 @@ parser.add_argument('--grpo_KL_weight', action='store_true', help='')
 parser.add_argument('--weight_temp', type=float, default=1., help='在grpo中使用权重进行调节KL的惩罚力度, 温度越小则惩罚越大(类别之间的惩罚力度差距会变大)')
 
 parser.add_argument('--is_dpo', action='store_true', help='是否使用DPO优化')
+parser.add_argument('--abla_kl', action='store_true', help='把kl消融掉')
+parser.add_argument('--abla_dpo', action='store_true', help='把dpo消融掉')
+
 parser.add_argument('--dev', action='store_true', help='开发版')
 
 parser.add_argument('--num_prompts_per_class', type=int, default=3, help='对于一张图像, 会采样出多少个prompt, 等于GRPO组的大小')

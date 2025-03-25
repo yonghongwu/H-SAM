@@ -524,7 +524,8 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
             )
         elif args.is_dpo:
             rewards = rewards.reshape(-1, num_prompts_per_class)
-            loss, cls_loss = dpo_loss_segmentation(policy_logits=adaptive_pool(current_logits), ref_logits=adaptive_pool(ref_logits), gt_masks=decoded_mask, rewards=rewards, beta=beta)
+            loss, cls_loss = dpo_loss_segmentation(policy_logits=adaptive_pool(current_logits), ref_logits=adaptive_pool(ref_logits), gt_masks=decoded_mask, 
+                                                   rewards=rewards, beta=beta, abla_kl=args.abla_kl, abla_dpo=args.abla_dpo)
         else: raise ValueError
 
         # 绘图
@@ -1010,7 +1011,7 @@ def grpo_loss_v4(current_logits, ref_logits, gt_masks, advantages, beta=0.05, cl
     return loss, kl_div.mean(), sample_loss
 
 
-def dpo_loss_segmentation(policy_logits, ref_logits, gt_masks, rewards, beta=0.05, criterion=nn.BCEWithLogitsLoss()):
+def dpo_loss_segmentation(policy_logits, ref_logits, gt_masks, rewards, beta=0.05, criterion=nn.BCEWithLogitsLoss(), abla_kl=False, abla_dpo=False):
     """
     note: https://github.com/modelscope/ms-swift/blob/main/swift/trainers/rlhf_trainer/dpo_trainer.py
     像素级 DPO Loss for 语义分割 (二分类前景分割).
@@ -1040,13 +1041,23 @@ def dpo_loss_segmentation(policy_logits, ref_logits, gt_masks, rewards, beta=0.0
     logits = pi_logratios - ref_logratios
 
     # 3. DPO Loss (像素级别)
-    loss = -F.logsigmoid(beta * logits)
+    dpo_loss = -F.logsigmoid(beta * logits)
 
-    sample_loss_choosen = criterion(policy_chosen_logps, gt_masks.float().cuda()[torch.argmax(rewards, dim=1)])
-    sample_loss_rejected = criterion(policy_rejected_logps, gt_masks.float().cuda()[torch.argmin(rewards, dim=1)])
-    sample_loss = sample_loss_choosen + sample_loss_rejected * 0.3
+    if abla_kl:
+        loss = dpo_loss.mean()
+        sample_loss = torch.tensor(0).cuda()
+    elif abla_dpo:
+        sample_loss_choosen = criterion(policy_chosen_logps, gt_masks.float().cuda()[torch.argmax(rewards, dim=1)])
+        sample_loss_rejected = criterion(policy_rejected_logps, gt_masks.float().cuda()[torch.argmin(rewards, dim=1)])
+        sample_loss = sample_loss_choosen + sample_loss_rejected * 0.3
 
-    loss = loss.mean() + sample_loss
+        loss = sample_loss
+    else:
+        sample_loss_choosen = criterion(policy_chosen_logps, gt_masks.float().cuda()[torch.argmax(rewards, dim=1)])
+        sample_loss_rejected = criterion(policy_rejected_logps, gt_masks.float().cuda()[torch.argmin(rewards, dim=1)])
+        sample_loss = sample_loss_choosen + sample_loss_rejected * 0.3
+
+        loss = dpo_loss.mean() + sample_loss
     return loss, sample_loss
 
 
