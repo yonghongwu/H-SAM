@@ -174,8 +174,6 @@ class RandomGenerator(object):
         # if random.random() > 0.6:
         #     image = random_gaussian(image, var=0.05)
         
-        
-        
         x, y = image.shape
         if x != self.output_size[0] or y != self.output_size[1]:
             image = zoom(image, (self.output_size[0] / x, self.output_size[1] / y), order=3)  # why not 3?
@@ -201,7 +199,7 @@ class Synapse_dataset(Dataset):
         return len(self.sample_list)
 
     def __getitem__(self, idx):
-        if self.split == "train":
+        if 'train' in self.split:
             slice_name = self.sample_list[idx].strip('\n')
             data_path = os.path.join(self.data_dir, slice_name+'.npz')
             data = np.load(data_path)
@@ -220,3 +218,50 @@ class Synapse_dataset(Dataset):
             sample = self.transform(sample)
         sample['case_name'] = self.sample_list[idx].strip('\n')
         return sample
+
+
+def filter_samples_by_label_sum(base_dir, list_dir, split, output_file):
+    import os
+    import numpy as np
+    import h5py
+    from tqdm import tqdm
+    # 打开原始样本列表文件
+    list_path = os.path.join(list_dir, f"{split}.txt")
+    with open(list_path, 'r') as f:
+        sample_names = [line.strip('\n') for line in f.readlines()]
+
+    valid_samples = []
+
+    for name in tqdm(sample_names):
+        if 'train' in split:
+            file_path = os.path.join(base_dir, f"{name}.npz")
+            if not os.path.exists(file_path):
+                print(f"File not found: {file_path}")
+                continue
+            with np.load(file_path) as data:
+                label = data['label']
+        else:
+            file_path = os.path.join(base_dir, f"{name}.npy.h5")
+            if not os.path.exists(file_path):
+                print(f"File not found: {file_path}")
+                continue
+            with h5py.File(file_path, 'r') as data:
+                label = data['label'][:]
+
+        if label.sum() != 0:
+            valid_samples.append(name)
+
+    # 写入新的文件
+    with open(output_file, 'w') as f:
+        for name in valid_samples:
+            f.write(f"{name}\n")
+
+    print(f"Filtered {len(valid_samples)} valid samples and saved to {output_file}")
+
+
+if __name__ == "__main__":
+    base_dir = '/database/wuyonghuang/hsam_code/data/multi-organ-CT/train_npz_512/'
+    list_path = '/database/wuyonghuang/hsam_code/lists/lists_Synapse'
+    split = 'train_220'
+    output_file = '/database/wuyonghuang/hsam_code/lists/lists_Synapse/train_220_clean.txt'
+    filter_samples_by_label_sum(base_dir, list_path, split, output_file)

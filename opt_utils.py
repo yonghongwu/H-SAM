@@ -1,76 +1,143 @@
-import os
+import os, copy
 import cv2
 import torch 
+import numpy as np
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+
 from torch import nn
+from tqdm import tqdm
 from einops import rearrange
-from gen_prompt import generate_prompts_from_semantic_mask, get_prompt_preds, concatenate_masks_and_scores_v2, plot_results
+from collections import defaultdict
 from utils import get_decoded_mask
+from gen_prompt import generate_prompts_from_semantic_mask, get_prompt_preds, concatenate_masks_and_scores_v2, plot_results
 
-def vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, args=None):
+
+def vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, args=None, only_train_unet=False, **kwargs):
     batch_losses = []
+
+    if only_train_unet:
+        assert len(kwargs) != 0
+
     for image_idx, label_idx in zip(range(image_batch.shape[0]), range(label_batch.shape[0])):
-        image, label = image_batch[image_idx].permute(1, 2, 0).cpu().numpy(), label_batch[label_idx].cpu().numpy()   # low_res_label_batch[0].cpu().numpy()
+        if not only_train_unet:
+            image, label = image_batch[image_idx].permute(1, 2, 0).cpu().numpy(), label_batch[label_idx].cpu().numpy()   # low_res_label_batch[0].cpu().numpy()
 
-        if label.mean() == 0: print("无前景; Skip"); continue
+            if label.mean() == 0: print("无前景; Skip"); continue
 
-        # 获取 prompts、二值化的多类别掩码
-        prompts = generate_prompts_from_semantic_mask(
-            label,
-            class_ids=None,  # 处理所有类别
-            num_positive_points=(2, 3),
-            num_negative_points=(4, 6),
-            num_prompts_per_class=num_prompts_per_class,  # 每个类别生成3组prompt
-            point_sampling_strategy="center_weighted",
-            box_noise_level=0.1,
-            generate_box=True,
-            generate_points=True
-        )
+            # 获取 prompts、二值化的多类别掩码
+            prompts = generate_prompts_from_semantic_mask(
+                label,
+                class_ids=None,  # 处理所有类别
+                num_positive_points=(2, 3),
+                num_negative_points=(4, 6),
+                num_prompts_per_class=num_prompts_per_class,  # 每个类别生成3组prompt
+                point_sampling_strategy="center_weighted",
+                box_noise_level=0.1,
+                generate_box=True,
+                generate_points=True
+            )
 
-        decoded_mask = prompts['decoded_mask']
-        # 按照decoded_mask的键的顺序进行排序, 然后将值重复三次再全部拼接起来。
-        exist_keys = sorted(decoded_mask.keys())
-        for key in exist_keys:
-            # decoded_mask[key] = np.repeat(decoded_mask[key], 3, axis=0)
-            decoded_mask[key] = torch.from_numpy(decoded_mask[key])[None].long().repeat(num_prompts_per_class, 1, 1)
-        decoded_mask = torch.concat(list(decoded_mask.values()), dim=0)
+            decoded_mask = prompts['decoded_mask']
+            # 按照decoded_mask的键的顺序进行排序, 然后将值重复三次再全部拼接起来。
+            exist_keys = sorted(decoded_mask.keys())
+            for key in exist_keys:
+                # decoded_mask[key] = np.repeat(decoded_mask[key], 3, axis=0)
+                decoded_mask[key] = torch.from_numpy(decoded_mask[key])[None].long().repeat(num_prompts_per_class, 1, 1)
+            decoded_mask = torch.concat(list(decoded_mask.values()), dim=0)
 
-        # 函数: 接受 image、point、model, 输出 prediction
-        model.set_image(image)
-        results = get_prompt_preds(model, prompts, prompt_mode=args.prompt_type, multimask_output=True, only_best_score_pred=True, only_save_best_prompt_pred=False)
-        all_logits, all_scores, category_indices = concatenate_masks_and_scores_v2(results['prompts_preds'], sort_keys=True)
+            # 函数: 接受 image、point、model, 输出 prediction
+            model.set_image(image)
+            results = get_prompt_preds(model, prompts, prompt_mode=args.prompt_type, multimask_output=True, only_best_score_pred=True, only_save_best_prompt_pred=False)
+            all_logits, all_scores, category_indices = concatenate_masks_and_scores_v2(results['prompts_preds'], sort_keys=True)
 
-        criterion = nn.BCEWithLogitsLoss()
-        adaptive_pool = nn.AdaptiveAvgPool2d(decoded_mask.shape[-2:])
+            criterion = nn.BCEWithLogitsLoss()
+            adaptive_pool = nn.AdaptiveAvgPool2d(decoded_mask.shape[-2:])
 
-        sample_loss = criterion(adaptive_pool(all_logits), decoded_mask.float().cuda())
-        batch_losses.append(sample_loss)
+            sample_loss = criterion(adaptive_pool(all_logits), decoded_mask.float().cuda())
+            batch_losses.append(sample_loss)
 
-        # 展示结果
-        # plot_results(results, image, label, plot_prompts_preds=True, save_path_lst=None)
+            # 展示结果
+            # plot_results(results, image, label, plot_prompts_preds=True, save_path_lst=None)
 
-    loss = torch.stack(batch_losses).mean()
-    optimizer.zero_grad()
+            loss = torch.stack(batch_losses).mean()
+            optimizer.zero_grad()
 
-    # 根据是否使用scaler选择不同的反向传播和优化步骤
-    if scaler is not None:
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        loss.backward()
-        optimizer.step()
-    return loss.item(), None
+            # 根据是否使用scaler选择不同的反向传播和优化步骤
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+            return loss.item(), None
+        
+        else:
+            # 这里就是直接用unet进行训练
+            image = image_batch[image_idx:image_idx+1]
+            label = label_batch[label_idx:label_idx+1]
+            pred = kwargs['net_semi'](image[:, 0:1])  # 只使用2D slice的第一个通道(其实三个通道的信息是一样的, 因为这是医学数据); shape: (B, cls, H, W)
+            loss = F.cross_entropy(pred, label.long().cuda())
+            batch_losses.append(loss)
+
+            loss = torch.stack(batch_losses).mean()
+            kwargs['optimizer_semi'].zero_grad()
+
+            # 根据是否使用scaler选择不同的反向传播和优化步骤
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(kwargs['optimizer_semi'])
+                scaler.update()
+            else:
+                loss.backward()
+                kwargs['optimizer_semi'].step()
+            return loss.item(), None
 
 
 @torch.no_grad()
-def vanilla_eva(model, image_batch, label_batch, num_prompts_per_class=3, args=None):
+def vanilla_eva(model, image_batch, label_batch, num_prompts_per_class=3, args=None, **kwargs):
     batch_losses, batch_ious = [], []
-    for image_idx, label_idx in zip(range(image_batch.shape[0]), range(label_batch.shape[0])):
+    all_iou_scores_semi = {} # Stores list of IoUs for each class label
+    all_dice_scores_semi = {} # Stores list of Dice scores for each class label
+
+    for image_idx, label_idx in tqdm(zip(range(image_batch.shape[0]), range(label_batch.shape[0]))):
+        
+        if kwargs.get('net_semi', None):    # 传入了 unet 模型或者其他 net_semi 模型, 则说明要对unet进行评估
+            image = image_batch[image_idx:image_idx+1][:, 0:1].cuda()
+            label = label_batch[label_idx:label_idx+1].cuda()
+            # label_name = list(set(torch.unique(label).cpu().numpy())-set([0]))  # 只关注前景
+
+            current_label_numpy = label[0].cpu().numpy().astype(np.int64)
+            present_foreground_labels = sorted(list(set(range(args.num_classes+1)) - set([0])))
+
+            with torch.no_grad():
+                pred = kwargs['net_semi'](image)  # 只使用2D slice的第一个通道(其实三个通道的信息是一样的, 因为这是医学数据); shape: (B, cls, H, W)
+            pred_classes_numpy = torch.argmax(pred, dim=1)[0].cpu().numpy().astype(np.int64)
+            
+            label_flat = current_label_numpy.flatten()
+            pred_flat = pred_classes_numpy.flatten()
+
+            from sklearn.metrics import jaccard_score, f1_score, confusion_matrix
+            iou_per_class = jaccard_score(label_flat, pred_flat, labels=present_foreground_labels, average=None, zero_division=0)
+            dice_per_class = f1_score(label_flat, pred_flat, labels=present_foreground_labels, average=None, zero_division=0)
+
+            for i, class_label in enumerate(present_foreground_labels):
+                if class_label not in all_iou_scores_semi:
+                    all_iou_scores_semi[class_label] = []
+                    all_dice_scores_semi[class_label] = []
+                all_iou_scores_semi[class_label].append(iou_per_class[i])
+                all_dice_scores_semi[class_label].append(dice_per_class[i])
+
+            # plt.imshow(torch.argmax(pred, dim=1)[0].cpu().numpy()); plt.savefig(f'test-idx_{label_idx}-pred.jpg')
+            # plt.imshow(label[0].cpu().numpy()); plt.savefig(f'test-idx_{label_idx}-lab.jpg')
+        
+        if args.only_train_unet:
+            continue
+
         image, label = image_batch[image_idx].permute(1, 2, 0).cpu().numpy(), label_batch[label_idx].cpu().numpy()   # low_res_label_batch[0].cpu().numpy()
 
-        if label.mean() == 0: print("无前景; Skip"); continue
+        if label.mean() == 0: continue
 
         # 获取 prompts、二值化的多类别掩码
         prompts = generate_prompts_from_semantic_mask(
@@ -89,7 +156,7 @@ def vanilla_eva(model, image_batch, label_batch, num_prompts_per_class=3, args=N
 
         # 函数: 接受 image、point、model, 输出 prediction
         model.set_image(image)
-        results = get_prompt_preds(model, prompts, prompt_mode=args.prompt_type, multimask_output=True, only_best_score_pred=True, only_save_best_prompt_pred=False)
+        results = get_prompt_preds(model, prompts, prompt_mode=args.prompt_type, multimask_output=True, only_best_score_pred=args.onlybest_in_multimask_output, only_save_best_prompt_pred=False)
         all_logits, all_scores, category_indices = concatenate_masks_and_scores_v2(results['prompts_preds'], sort_keys=True)
 
         criterion = nn.BCEWithLogitsLoss()
@@ -107,18 +174,17 @@ def vanilla_eva(model, image_batch, label_batch, num_prompts_per_class=3, args=N
         for idx, i in enumerate(sorted(set(np.unique(label).astype(np.uint8)) - set([0]))):
             coupled_mask += (adaptive_pool(all_logits) > 0).cpu().numpy().astype(np.uint8)[idx] * i
 
+    mean_iou_per_class_net_semi = {cls: np.mean(scores) for cls, scores in all_iou_scores_semi.items()}
+    mean_dice_per_class_net_semi = {cls: np.mean(scores) for cls, scores in all_dice_scores_semi.items()}
+
+    if args.only_train_unet:
+        return 0, 0, (mean_iou_per_class_net_semi, mean_dice_per_class_net_semi)
+    
     loss = torch.stack(batch_losses).mean()
     iou = np.stack(batch_ious).mean()
 
-    return loss.item(), iou
+    return loss.item(), iou, (mean_iou_per_class_net_semi, mean_dice_per_class_net_semi)
 
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import copy
-from collections import defaultdict
 
 # 1. 首先创建参考模型（冻结的SAM副本）
 def create_reference_model(model):
@@ -141,6 +207,28 @@ def normalize_in_chunks(x, chunk_size, temperature=1.0):
         std = chunk.std(unbiased=False)  # 使用无偏估计
         result[i:i+chunk_size] = (chunk - mean) / (std + 1e-8) / temperature
 
+    return result
+
+def normalize_in_chunks_v2(x, chunk_size, temperature=1.0):
+    # Vectorized Example
+    N = x.shape[0]
+    num_chunks = N // chunk_size
+    if N % chunk_size != 0:
+        # Handle cases where length is not a multiple of chunk_size if necessary
+        print("Warning: length of x is not a multiple of chunk_size")
+
+    # Reshape into chunks
+    x_reshaped = x.view(num_chunks, chunk_size) # Or -1 instead of num_chunks
+
+    # Calculate mean and std per chunk (along dim=1)
+    mean = x_reshaped.mean(dim=1, keepdim=True)
+    std = x_reshaped.std(dim=1, keepdim=True, unbiased=False) # Or unbiased=True
+
+    # Normalize and apply temperature
+    normalized_x = (x_reshaped - mean) / (std + 1e-8) / temperature
+
+    # Reshape back to original shape
+    result = normalized_x.view(-1) 
     return result
 
 
@@ -379,23 +467,39 @@ def grpo_loss(current_logits, ref_logits, pred_masks, gt_masks, rewards, beta=0.
 
 
 # 5. 主要训练循环修改
-def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, beta=0.05, clip_param=0.2, iteration=0, writer=None, args=False):
+def train_with_po(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, beta=0.05, clip_param=0.2, iteration=0, writer=None, args=False, **kwargs):
     # 创建参考模型 (如果尚未创建)
-    if not hasattr(train_with_grpo, 'ref_model'):
-        train_with_grpo.ref_model = create_reference_model(model)
+    if not hasattr(train_with_po, 'ref_model'):
+        train_with_po.ref_model = create_reference_model(model)
     
-    ref_model = train_with_grpo.ref_model
+    ref_model = train_with_po.ref_model
     
     batch_losses = []
     all_rewards = []
+    idx_count = 0
+
+    if len(kwargs) != 0:
+        assert args.semi == True
+        image_batch_un = kwargs['image_un']
+        label_batch_un = kwargs['label_un']
     
-    for idx, (image_idx, label_idx) in enumerate(zip(range(image_batch.shape[0]), range(label_batch.shape[0]))):
-        image_idx_in_all_trainset = iteration*image_batch.shape[0]+idx
+    for idx, (image_idx, label_idx) in enumerate(zip(range(image_batch.shape[0]), range(label_batch.shape[0]))):    # 假设 有标注数据和未标注数据的比例是 1:1
+        image_idx_in_all_trainset = iteration * image_batch.shape[0] + idx_count
         image, label = image_batch[image_idx].permute(1, 2, 0).cpu().numpy(), label_batch[label_idx].cpu().numpy()
         
-        if label.mean() == 0: 
-            # print("无前景; Skip")
-            continue
+        idx_count += 1
+
+        if args.semi:
+            image_un = image_batch_un[image_idx:image_idx+1]
+            pred_un = kwargs['net_semi'](image_un[:, 0:1])  # 只使用2D slice的第一个通道(其实三个通道的信息是一样的, 因为这是医学数据); shape: (B, cls, H, W)
+            # note: 半监督算法在视觉上的常见算法: MT\Fixmatch, 这里要新的半监督算法: 基于DPO来实现半监督, 可以使用正则化来提供额外的监督
+            # 1. 处理 pred_un 成二分类的集合, 找到每个类别的最大连通区域作为mask; 2. 生成point 和 box prompt; 3. 分别给 actor 和 ref_model 使用, 对于 DPO, ref_model 为最优
+            from semi_utils import process_segmentation_output
+            mask_un = process_segmentation_output(output_tensor=pred_un)
+
+            # TODO: 生成 prompt
+
+            # TODO: 输入给 actor 和 ref_model
         
         if isinstance(args.pos_point_num, tuple):
             num_pos_points = np.random.randint(*args.pos_point_num, size=(1))[0]
@@ -433,7 +537,7 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
             results = get_prompt_preds(
                 model, prompts, prompt_mode=args.prompt_type,     
                 multimask_output=True, 
-                only_best_score_pred=True, 
+                only_best_score_pred=args.onlybest_in_multimask_output, 
                 only_save_best_prompt_pred=False,
             )
             
@@ -483,8 +587,8 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
         # note: grpo 会出现 loss为负数的情况: https://mp.weixin.qq.com/s/IsPIpsemqtJXNlcb3hJi-A
         if args.rw_dispered:
             # rewards = continuous_to_dispersed(compute_reward(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class)).flatten()
-            rewards1 = continuous_to_dispersed_v2(compute_reward(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class), scheme=1)
-            rewards2 = continuous_to_dispersed_v2(compute_reward(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class), scheme=2)
+            rewards1 = continuous_to_dispersed_v2(compute_reward_v2(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class), scheme=1)
+            rewards2 = continuous_to_dispersed_v2(compute_reward_v2(adaptive_pool(current_logits), decoded_mask.float()).reshape(-1, num_prompts_per_class), scheme=2)
             
             if args.rw_func == 'f1':
                 rewards = rewards1.flatten()
@@ -499,19 +603,19 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
             log_structured_rewards_stats(rewards2, num_prompts_per_class, step=image_idx_in_all_trainset, logger=writer, class_keys=class_keys, name='rewards2')
 
         else:
-            rewards = normalize_in_chunks(compute_reward(adaptive_pool(current_logits), decoded_mask.float()), chunk_size=num_prompts_per_class, temperature=args.rw_temp)   # 向量
+            rewards = normalize_in_chunks_v2(compute_reward_v2(adaptive_pool(current_logits), decoded_mask.float()), chunk_size=num_prompts_per_class, temperature=args.rw_temp)   # 向量
         
         if args.grpo_KL_weight:
             cls_weights = torch.softmax(
-                1 / normalize_in_chunks(
-                    compute_reward(adaptive_pool(current_logits), decoded_mask.float()), 
+                1 / normalize_in_chunks_v2(
+                    compute_reward_v2(adaptive_pool(current_logits), decoded_mask.float()), 
                     chunk_size=num_prompts_per_class, temperature=2).reshape(-1, num_prompts_per_class).max(dim=1)[0] / args.weight_temp, 
                 dim=0)
             cls_weights = cls_weights[None].repeat(num_prompts_per_class, 1).transpose(0, 1).flatten().cuda()
 
         if args.is_grpo:
             advantages = rewards.unsqueeze(-1).unsqueeze(-1).expand_as(adaptive_pool(current_logits))   # 扩展维度以匹配logits (N, 1, 1) -> (N, H, W)
-            loss, kl_div, sample_loss = grpo_loss_v4(
+            loss, kl_div, sample_loss = grpo_loss_v5(
                 adaptive_pool(current_logits), 
                 adaptive_pool(ref_logits), 
                 decoded_mask, 
@@ -525,7 +629,7 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
         elif args.is_dpo:
             rewards = rewards.reshape(-1, num_prompts_per_class)
             loss, cls_loss = dpo_loss_segmentation(policy_logits=adaptive_pool(current_logits), ref_logits=adaptive_pool(ref_logits), gt_masks=decoded_mask, 
-                                                   rewards=rewards, beta=beta, abla_kl=args.abla_kl, abla_dpo=args.abla_dpo)
+                                                   rewards=rewards, beta=beta, abla_kl=args.abla_kl, abla_dpo=args.abla_dpo, dpo_weight=args.dpo_weight, args=args)
         else: raise ValueError
 
         # 绘图
@@ -539,7 +643,7 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
                 # for idx in range(len(result_images)):
                     # plt.figure(); plt.imshow(result_images[idx]); plt.title(f'cls{i_cls}-{idx}'); plt.savefig(f'./cls{i_cls}-{idx}.jpg'); plt.close()
             save_paths= [os.path.join('./vis_imgs', f'./{image_idx_in_all_trainset}-cls{i_cls}-{idx}.jpg') for i_cls in organized_prompts.keys() for idx in range(len(result_images))]
-            plot_results_np([image] * len(current_logits), all_prompts_vis_imgs, (current_logits > 0).cpu().numpy(), decoded_mask.cpu().numpy(), rewards=rewards.cpu().numpy(), save_paths=save_paths)
+            # plot_results_np([image] * len(current_logits), all_prompts_vis_imgs, (current_logits > 0).cpu().numpy(), decoded_mask.cpu().numpy(), rewards=rewards.cpu().numpy(), save_paths=save_paths)
 
         if writer is not None:
             if args.is_grpo:
@@ -560,7 +664,7 @@ def train_with_grpo(model, optimizer, scaler, image_batch, label_batch, num_prom
         total_loss = torch.stack(batch_losses).mean()
         
         optimizer.zero_grad()
-        total_loss.backward()
+        scaler.scale(total_loss).backward()
         torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)  # 添加梯度裁剪
         optimizer.step()
         
@@ -707,10 +811,7 @@ def read_batch(imgs=np.random.randint(0, 255, (16, 3, 512, 512)), labs=np.random
 
 
 def train_with_seg_single(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, beta=0.05, clip_param=0.2, iteration=0, writer=None, args=False):
-    if not hasattr(train_with_grpo, 'ref_model'):
-        train_with_grpo.ref_model = create_reference_model(model)
-    ref_model = train_with_grpo.ref_model
-
+    # https://github.com/sagieppel/fine-tune-train_segment_anything_2_in_60_lines_of_code/
     if label_batch.sum() == 0:
         return 0, 0
     
@@ -776,11 +877,7 @@ def train_with_seg_single(model, optimizer, scaler, image_batch, label_batch, nu
     return 0, 0
 
 
-def train_with_seg_batch(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, beta=0.05, clip_param=0.2, iteration=0, writer=None, args=False):
-    if not hasattr(train_with_grpo, 'ref_model'):
-        train_with_grpo.ref_model = create_reference_model(model)
-    ref_model = train_with_grpo.ref_model
-
+def train_with_seg_batch(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, beta=0.05, clip_param=0.2, iteration=0, writer=None, args=False, **kwargs):
     if label_batch.sum() == 0:
         return 0, 0
     
@@ -1011,7 +1108,125 @@ def grpo_loss_v4(current_logits, ref_logits, gt_masks, advantages, beta=0.05, cl
     return loss, kl_div.mean(), sample_loss
 
 
-def dpo_loss_segmentation(policy_logits, ref_logits, gt_masks, rewards, beta=0.05, criterion=nn.BCEWithLogitsLoss(), abla_kl=False, abla_dpo=False):
+def stable_log_sigmoid(logits):
+    """Numerically stable log sigmoid."""
+    # log(sigmoid(x)) = log(1 / (1 + exp(-x))) = -log(1 + exp(-x)) = -softplus(-x)
+    return -F.softplus(-logits)
+
+def stable_log_one_minus_sigmoid(logits):
+    """Numerically stable log(1 - sigmoid(x))."""
+    # log(1 - sigmoid(x)) = log(exp(-x) / (1 + exp(-x))) = -x - log(1 + exp(-x)) = -x - softplus(-x) = -softplus(x)
+    return -F.softplus(logits)
+
+def grpo_loss_v5(
+    current_logits,  # 当前模型输出的 logits (经过 adaptive_pool)
+    ref_logits,      # 参考模型输出的 logits (经过 adaptive_pool)
+    decoded_mask,    # GT mask (可能不需要，因为 advantage 已基于此计算)
+    advantages,      # 预先计算的优势值 (通常基于奖励)，已扩展到 logits 形状
+    beta,            # KL 散度惩罚系数
+    weights=None,    # 可选的样本权重 (例如，基于类别的 KL 权重)
+    clip_param=0.2,  # PPO 裁剪参数 epsilon
+    gen_logits=None, # 生成数据时（前向传播时）的 logits (detached, 经过 adaptive_pool)
+    num_prompts_per_class=1 # (可能不需要，除非权重需要特殊处理)
+):
+    """
+    计算 GRPO (PPO-style) 损失。
+
+    Args:
+        current_logits (torch.Tensor): 当前策略网络的 logits (N, H, W) 或 (N, C, H, W)。
+                                        假设是 (N, H, W) 代表二分类分割的 logits。
+        ref_logits (torch.Tensor): 参考策略网络的 logits (N, H, W)。
+        decoded_mask (torch.Tensor): GT mask (N, H, W)。 (在此实现中未使用，优势已包含奖励信息)
+        advantages (torch.Tensor): 优势函数值，已扩展到 logits 形状 (N, H, W)。
+        beta (float): KL 散度惩罚项的系数。
+        weights (torch.Tensor, optional): 每个样本的权重 (N,)。默认为 None。
+        clip_param (float): PPO 裁剪范围 (epsilon)。
+        gen_logits (torch.Tensor): 用于计算 PPO 比率的生成时 logits (N, H, W)。
+        num_prompts_per_class (int): (在此实现中未使用)。
+
+    Returns:
+        tuple: (总损失, KL 散度部分, PPO 样本损失部分)
+    """
+    # 确保 gen_logits 存在
+    if gen_logits is None:
+        raise ValueError("gen_logits must be provided for PPO ratio calculation.")
+
+    # --- 1. 计算 PPO 裁剪替代目标 (Clipped Surrogate Objective) ---
+
+    # 计算当前策略和生成策略下，每个像素"动作"的对数概率
+    # 假设是二分类问题，使用 log sigmoid
+    # log π_θ(a|s)  (a 代表像素值，这里用 logits 近似)
+    log_probs_current = stable_log_sigmoid(current_logits)
+    # log π_θ_old(a|s) (生成数据时的策略)
+    log_probs_gen = stable_log_sigmoid(gen_logits) # gen_logits 应该是 detach() 过的
+
+    # 计算重要性采样比率 r(θ) = π_θ / π_θ_old = exp(log π_θ - log π_θ_old)
+    # 在实践中，直接使用 log ratio 更稳定
+    log_ratio = log_probs_current - log_probs_gen
+    ratio = torch.exp(log_ratio)
+
+    # 计算 PPO 目标函数的两个部分
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * advantages
+
+    # PPO 损失是最小化目标的负值 (因为我们要最大化目标函数)
+    # 对每个像素计算损失，然后取平均
+    # 注意：这里假设 advantages > 0 对应好的动作，< 0 对应坏的动作
+    # PPO 论文是 E[min(r*A, clip(r)*A)], 我们要最小化 -E[...]
+    ppo_loss_per_pixel = -torch.min(surr1, surr2)
+
+    # --- 2. 计算 KL 散度惩罚 ---
+    # KL(π_ref || π_θ) 或 KL(π_θ || π_ref)
+    # 通常计算 KL( 当前策略 || 参考策略 ) 作为惩罚项
+    # KL散度 D_KL(P || Q) for Bernoulli distributions parameterized by logits l_p, l_q:
+    # p * (log p - log q) + (1-p) * (log(1-p) - log(1-q))
+    # where p = sigmoid(l_p), q = sigmoid(l_q)
+
+    # 使用稳定计算的版本
+    log_p_current = stable_log_sigmoid(current_logits)
+    log_one_minus_p_current = stable_log_one_minus_sigmoid(current_logits)
+    log_p_ref = stable_log_sigmoid(ref_logits)
+    log_one_minus_p_ref = stable_log_one_minus_sigmoid(ref_logits)
+
+    # 计算 KL( ref || current ) - 稍微简单点，因为 ref_logits 不需要梯度
+    # p_ref = torch.sigmoid(ref_logits.detach()) # 不需要梯度
+    # kl_div_per_pixel = p_ref * (log_p_ref - log_p_current) + \
+    #                    (1 - p_ref) * (log_one_minus_p_ref - log_one_minus_p_current)
+
+    # 或者计算 KL( current || ref ) - 更常见于约束当前策略不要偏离参考策略太远
+    p_current = torch.sigmoid(current_logits) # 需要梯度
+    kl_div_per_pixel = p_current * (log_p_current - log_p_ref) + \
+                       (1 - p_current) * (log_one_minus_p_current - log_one_minus_p_ref)
+
+
+    # --- 3. 聚合和加权 ---
+
+    # 对空间维度 (H, W) 求平均得到每个样本的损失
+    ppo_loss_per_sample = ppo_loss_per_pixel.mean(dim=[1, 2])
+    kl_div_per_sample = kl_div_per_pixel.mean(dim=[1, 2])
+
+    # 应用样本权重 (如果提供)
+    if weights is not None:
+        # 确保权重形状匹配 (N,)
+        if weights.shape[0] != ppo_loss_per_sample.shape[0]:
+             raise ValueError(f"Weights shape {weights.shape} does not match sample shape {ppo_loss_per_sample.shape}")
+        # 加权平均
+        weighted_ppo_loss = (ppo_loss_per_sample * weights).mean()
+        weighted_kl_div = (kl_div_per_sample * weights).mean()
+    else:
+        # 直接平均
+        weighted_ppo_loss = ppo_loss_per_sample.mean()
+        weighted_kl_div = kl_div_per_sample.mean()
+
+    # --- 4. 计算总损失 ---
+    total_loss = weighted_ppo_loss + beta * weighted_kl_div
+
+    # 返回总损失以及各部分，方便记录和调试
+    # 返回的 sample_loss 应该是 PPO 目标部分，kl_div 是 KL 惩罚部分
+    return total_loss, weighted_kl_div, weighted_ppo_loss
+
+
+def dpo_loss_segmentation(policy_logits, ref_logits, gt_masks, rewards, beta=0.05, criterion=nn.BCEWithLogitsLoss(), abla_kl=False, abla_dpo=False, dpo_weight=1., args=None):
     """
     note: https://github.com/modelscope/ms-swift/blob/main/swift/trainers/rlhf_trainer/dpo_trainer.py
     像素级 DPO Loss for 语义分割 (二分类前景分割).
@@ -1027,13 +1242,28 @@ def dpo_loss_segmentation(policy_logits, ref_logits, gt_masks, rewards, beta=0.0
         loss: DPO loss.
     """
     # 1. 计算 log 概率 (像素级别)
-    # policy_chosen_logps = torch.logsigmoid(policy_logits) * chosen_masks.float() # 只计算 chosen mask 区域的 log prob
-    # policy_rejected_logps = torch.logsigmoid(policy_logits) * rejected_masks.float() # 只计算 rejected mask 区域的 log prob
-    # ref_chosen_logps = torch.logsigmoid(ref_logits) * chosen_masks.float()
-    # ref_rejected_logps = torch.logsigmoid(ref_logits) * rejected_masks.float()
+    policy_logits = rearrange(policy_logits, '(b n) h w -> b n h w', n=args.num_prompts_per_class)
+    ref_logits = rearrange(ref_logits, '(b n) h w -> b n h w', n=args.num_prompts_per_class)
+    mbatch_size, num_prompts, height, width = policy_logits.shape
+    chosen_indices = torch.argmax(rewards, dim=1)
+    rejected_indices = torch.argmin(rewards, dim=1)
+    
+    # chosen_indices = chosen_indices.view(15, 1, 1, 1).expand(-1, -1, 64, 64)
+    chosen_indices = torch.repeat_interleave(chosen_indices, repeats=height * width, dim=0).reshape(mbatch_size, 1, height, width)
+    rejected_indices = torch.repeat_interleave(rejected_indices, repeats=height * width, dim=0).reshape(mbatch_size, 1, height, width)
 
-    policy_chosen_logps, policy_rejected_logps = F.logsigmoid(policy_logits[torch.argmax(rewards, dim=1)]), F.logsigmoid(policy_logits[torch.argmin(rewards, dim=1)])
-    ref_chosen_logps, ref_rejected_logps = F.logsigmoid(ref_logits[torch.argmax(rewards, dim=1)]), F.logsigmoid(ref_logits[torch.argmin(rewards, dim=1)])
+    policy_logprobs, ref_logprobs = F.logsigmoid(policy_logits), F.logsigmoid(ref_logits)
+
+    # 判断对张量的操作是否正确
+    # a = torch.repeat_interleave(chosen_indices, repeats=height * width, dim=0).reshape(mbatch_size, 1, height, width)
+    # b = torch.gather(policy_logprobs, dim=1, index=a) 
+    # assert sum([(b[i, 0] - policy_logprobs[i, torch.argmax(rewards, dim=1)[i]]).mean().item() for i in range(5)]) == 0
+
+    # 根据选择和拒绝的索引，提取对应的 log probabilities
+    policy_chosen_logps = torch.gather(policy_logprobs, dim=1, index=chosen_indices) # Shape: (mbatch_size, 1, height, width)
+    policy_rejected_logps = torch.gather(policy_logprobs, dim=1, index=rejected_indices) # Shape: (mbatch_size, 1, height, width)
+    ref_chosen_logps = torch.gather(ref_logprobs, dim=1, index=chosen_indices) # Shape: (mbatch_size, 1, height, width)
+    ref_rejected_logps = torch.gather(ref_logprobs, dim=1, index=rejected_indices) # Shape: (mbatch_size, 1, height, width)
 
     # 2. 计算 log ratios
     pi_logratios = policy_chosen_logps - policy_rejected_logps
@@ -1047,17 +1277,19 @@ def dpo_loss_segmentation(policy_logits, ref_logits, gt_masks, rewards, beta=0.0
         loss = dpo_loss.mean()
         sample_loss = torch.tensor(0).cuda()
     elif abla_dpo:
-        sample_loss_choosen = criterion(policy_chosen_logps, gt_masks.float().cuda()[torch.argmax(rewards, dim=1)])
-        sample_loss_rejected = criterion(policy_rejected_logps, gt_masks.float().cuda()[torch.argmin(rewards, dim=1)])
+        sample_loss_choosen = criterion(policy_chosen_logps.squeeze(1), gt_masks.float().cuda()[::args.num_prompts_per_class])   # criterion(policy_chosen_logps, gt_masks.float().cuda()[torch.argmax(rewards, dim=1)])
+        sample_loss_rejected = criterion(policy_rejected_logps.squeeze(1), gt_masks.float().cuda()[::args.num_prompts_per_class])  # criterion(policy_rejected_logps, gt_masks.float().cuda()[torch.argmin(rewards, dim=1)])
         sample_loss = sample_loss_choosen + sample_loss_rejected * 0.3
 
         loss = sample_loss
     else:
-        sample_loss_choosen = criterion(policy_chosen_logps, gt_masks.float().cuda()[torch.argmax(rewards, dim=1)])
-        sample_loss_rejected = criterion(policy_rejected_logps, gt_masks.float().cuda()[torch.argmin(rewards, dim=1)])
+        # sample_loss_choosen = criterion(policy_chosen_logps, gt_masks.float().cuda()[torch.argmax(rewards, dim=1)])
+        # sample_loss_rejected = criterion(policy_rejected_logps, gt_masks.float().cuda()[torch.argmin(rewards, dim=1)])
+        sample_loss_choosen = criterion(policy_chosen_logps.squeeze(1), gt_masks.float().cuda()[::args.num_prompts_per_class])   # criterion(policy_chosen_logps, gt_masks.float().cuda()[torch.argmax(rewards, dim=1)])
+        sample_loss_rejected = criterion(policy_rejected_logps.squeeze(1), gt_masks.float().cuda()[::args.num_prompts_per_class])  # criterion(policy_rejected_logps, gt_masks.float().cuda()[torch.argmin(rewards, dim=1)])
         sample_loss = sample_loss_choosen + sample_loss_rejected * 0.3
 
-        loss = dpo_loss.mean() + sample_loss
+        loss = dpo_weight * dpo_loss.mean() + sample_loss
     return loss, sample_loss
 
 
@@ -1105,8 +1337,6 @@ def extract_boundary(mask, kernel_size=3):
     返回:
         边界掩码, 其中边界像素为1, 其他为0
     """
-    import torch.nn.functional as F
-    
     # 确保输入是二值掩码
     if not torch.all((mask == 0) | (mask == 1)):
         mask = (mask > 0.5).float()
@@ -1161,6 +1391,48 @@ def compute_reward(pred_logits, gt_mask):
     
     # 组合奖励
     rewards = iou # + 0.2 * boundary_accuracy
+    return rewards
+
+def compute_reward_v2(pred_logits, gt_mask, metric='dice', smooth=1.0):
+    """
+    计算预测 logits 和 GT 掩码之间的奖励。
+
+    Args:
+        pred_logits (torch.Tensor): 模型输出的原始 logits (N, H, W)。
+        gt_mask (torch.Tensor): 真实掩码 (N, H, W)，通常是 0 或 1 的整数类型。
+        metric (str): 使用的奖励指标，可选 'dice' 或 'iou'。默认为 'dice'。
+        smooth (float): 用于防止除以零并增加数值稳定性的平滑因子。默认为 1.0。
+
+    Returns:
+        torch.Tensor: 每个样本的奖励值 (N,)。
+    """
+    # 1. 将 logits 转换为概率 (0 到 1 之间)
+    pred_probs = torch.sigmoid(pred_logits)
+
+    # 2. 确保 GT 掩码是 float 类型，以便进行乘法运算
+    gt_mask = gt_mask.float()
+
+    # 3. 计算交集和各自的总和 (在空间维度 H, W 上求和)
+    # 保留 batch 维度 N
+    intersection = (pred_probs * gt_mask).sum(dim=[1, 2])
+    pred_sum = pred_probs.sum(dim=[1, 2])
+    gt_sum = gt_mask.sum(dim=[1, 2])
+
+    # 4. 根据选择的指标计算奖励
+    if metric == 'dice':
+        # Soft Dice 系数: 2 * |A ∩ B| / (|A| + |B|)
+        rewards = (2. * intersection + smooth) / (pred_sum + gt_sum + smooth)
+    elif metric == 'iou':
+        # Soft IoU (Jaccard) 系数: |A ∩ B| / (|A ∪ B|) = |A ∩ B| / (|A| + |B| - |A ∩ B|)
+        union = pred_sum + gt_sum - intersection
+        rewards = (intersection + smooth) / (union + smooth)
+    else:
+        raise ValueError(f"不支持的 metric: {metric}. 请选择 'dice' 或 'iou'.")
+
+    # 5. （可选）添加其他奖励组件
+    # boundary_accuracy = compute_boundary_accuracy(pred_probs > 0.5, gt_mask) # 如果需要，可以基于阈值计算
+    # rewards = rewards + 0.1 * boundary_accuracy # 示例：组合奖励
+
     return rewards
 
 

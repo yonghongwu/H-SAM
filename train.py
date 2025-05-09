@@ -18,6 +18,7 @@ from segment_anything import sam_model_registry
 
 from trainer import trainer_synapse
 from icecream import ic
+from sende import let_me_know
 
 import shutil
 
@@ -39,7 +40,7 @@ parser.add_argument('--list_dir', type=str,
 parser.add_argument('--split', type=str,
                     default='train', help='list dir')
 parser.add_argument('--num_classes', type=int,
-                    default=8, help='output channel of network')
+                    default=8, help='output channel of network')    # 这个应该是前景类别
 parser.add_argument('--max_iterations', type=int,
                     default=30000, help='maximum epoch number to train')
 parser.add_argument('--max_epochs', type=int,
@@ -76,8 +77,8 @@ parser.add_argument('--interval_epoch', type=int, default=50, help='interval epo
 parser.add_argument('--model', type=str, default='sam2', choices=['hsam', 'sam2'], help='模型选择')
 parser.add_argument('--prompt_type', type=str, default='point', choices=['point', 'box', 'both'], help='prompt 类型')
 parser.add_argument('--is_strict', action='store_true', help='是否要求 point 在 box 内')
-parser.add_argument('--pos_point_num', type=parse_str, default='1', help='')    # note: 目前只在 train_with_seg_batch 中 使用
-parser.add_argument('--neg_point_num', type=parse_str, default='0', help='')
+parser.add_argument('--pos_point_num', type=parse_str, default='1', help='str(1), int(1), str("(1, 3)"))')    # note: 目前只在 train_with_seg_batch 中 使用
+parser.add_argument('--neg_point_num', type=parse_str, default='0', help='str(1), int(1), str("(1, 3)"))')
 
 parser.add_argument('--kl_prompt_type', type=str, default='box', choices=['point', 'box', 'both'], help='教师模型的 prompt 类型')
 parser.add_argument('--kl_is_strict', action='store_true', help='是否要求 point 在 box 内')
@@ -88,14 +89,15 @@ parser.add_argument('--is_grpo', action='store_true', help='是否使用grPO优�
 parser.add_argument('--rw_dispered', action='store_true', help='是否使用离散的奖励机制')
 parser.add_argument('--rw_func', type=str, default='all', choices=['f1', 'f2', 'all'], help='离散的奖励函数类型')
 parser.add_argument('--rw_temp', type=float, default=1., help='奖励的温度')
-parser.add_argument('--grpo_KL_weight', action='store_true', help='')
+parser.add_argument('--grpo_KL_weight', action='store_true', help='?')
 parser.add_argument('--weight_temp', type=float, default=1., help='在grpo中使用权重进行调节KL的惩罚力度, 温度越小则惩罚越大(类别之间的惩罚力度差距会变大)')
 
 parser.add_argument('--is_dpo', action='store_true', help='是否使用DPO优化')
+parser.add_argument('--dpo_weight', type=float, default=1., help='')
 parser.add_argument('--abla_kl', action='store_true', help='把kl消融掉')
 parser.add_argument('--abla_dpo', action='store_true', help='把dpo消融掉')
 
-parser.add_argument('--dev', action='store_true', help='开发版')
+parser.add_argument('--dev', action='store_true', help='来自 fine-tune-train_segment_anything_2_in_60_lines_of_code, 未调试成功')
 
 parser.add_argument('--num_prompts_per_class', type=int, default=3, help='对于一张图像, 会采样出多少个prompt, 等于GRPO组的大小')
 parser.add_argument('--kl_beta', type=float, default=0.05, help='调控KL散度')
@@ -106,23 +108,54 @@ parser.add_argument('--precision', type=str, default='bfloat16', choices=['float
 parser.add_argument('--exp_series', type=str, default='EXPS1', help='实验系列名称')
 parser.add_argument('--exp_name', type=str, default='exp1', help='实验名称')
 parser.add_argument('--desc', type=str, default='none', help='实验说明')
+
+parser.add_argument('--onlybest_in_multimask_output', action='store_true', help='If activated, only the best mask will be used in multimask_output')
+
+parser.add_argument('--semi', action='store_true', help='是否开启半监督任务')
+parser.add_argument('--semi_ratio', type=float, default=0.1, help='半监督任务中有标注数据的比例')
+parser.add_argument('--use_unet', action='store_true', help='是否使用 unet 来支持半监督或者其他算法')
+
+parser.add_argument('--only_train_unet', action='store_true', help='是否要进行unet的监督训练; 级别>grpo=dpo')
 args = parser.parse_args()
 
 if args.debug:
     os.environ["CUDA_VISIBLE_DEVICES"] = "3"
     args.n_gpu = int(torch.cuda.device_count())
     if args.model == 'sam2':
-        args.root_path = '/new_wyh/Synapse-multi-organ-CT-dataset/train_npz_new_224_with_foreground/'
+        args.root_path = '/database/wuyonghuang/hsam_code/data/multi-organ-CT/train_npz_512/'
+
+        # GRPO 训练的设置
         # args.is_grpo = True
         # args.rw_dispered = False
         # args.rw_temp = 3
         # args.grpo_KL_weight = True
         # args.weight_temp = 0.5
-        args.dev = True
+
+        # DPO 训练的设置
+        args.is_dpo = True
+
+        # args.dev = True
+
+        args.onlybest_in_multimask_output = False
+        args.ours_use_lora = True
+
+        args.semi = True    # TODO: 调试一下半监督
+        args.semi_ratio = 0.1
+        args.use_unet = True   # 默认使用 unet 模型
+
+        args.only_train_unet = False
+
     elif args.model == 'hsam':
         args.root_path = '/new_wyh/Synapse-multi-organ-CT-dataset/train_npz_new_224/'
-    args.split = 'train'
-    args.batch_size = 2
+    
+    if args.model == 'sam2' and args.semi and args.semi_ratio == 0.1:
+        args.split = 'train_220_clean'  # 剔除了只有背景的slice(数据)
+    elif args.model == 'sam2' and not args.semi:
+        args.split = 'train_clean'  # 剔除了只有背景的slice(数据)
+    else:
+        args.split = 'train'
+
+    args.batch_size = 4
     args.base_lr = 0.0026
     args.img_size = 224
     args.warmup = True
@@ -160,14 +193,19 @@ if __name__ == "__main__":
     tz = pytz.timezone('Asia/Shanghai')  # 东八区对应的时区
     current_time = datetime.datetime.now(tz).strftime("%Y%m%d_%H%M%S")
     
-    if args.is_grpo:
-        po_type = 'grpo_dispered' if args.rw_dispered else 'grpo'
-    elif args.is_dpo:
-        po_type = 'dpo'
-    elif args.dev:
-        po_type = 'dev'
+    if not args.only_train_unet:
+        if args.is_grpo:
+            po_type = 'grpo_dispered' if args.rw_dispered else 'grpo'
+        elif args.is_dpo:
+            po_type = 'dpo'
+        elif args.dev:
+            po_type = 'dev'
+        else:
+            po_type = 'nopo'
     else:
-        po_type = 'nopo'
+        # only_train_unet 级别更高
+        args.is_grpo, args.is_dpo, args.dev = False, False, False
+        po_type = 'nopo-unet'
     snapshot_path = os.path.join(args.output, args.exp_series, args.exp_name, f"{args.model}-{po_type}", "{}_{}".format(current_time, args.exp))
     snapshot_path = snapshot_path + '_pretrain' if args.is_pretrain else snapshot_path
     snapshot_path += '_' + args.vit_name
@@ -184,8 +222,8 @@ if __name__ == "__main__":
 
     code_dir = os.path.join(snapshot_path, 'code')
     if not os.path.exists(code_dir):
-        ignore_patterns = ['__pycache__', '.pytest_cache', '.git', '.vscode', 'data', 'checkpoints', 'env_hsam', 'env_hsam_copy', 'figure', 'output', 'sam2-main',
-                        'segment_anything', 'test_outputs', 'testset', 'vis_imgs', '*.pth', '*.npy']
+        ignore_patterns = ['__pycache__', '.pytest_cache', '.git', '.vscode', 'data', 'checkpoints', '*env_hsam', '*env_hsam_copy', 'figure', 'output', 'sam2-main',
+                        'segment_anything', 'test_outputs', 'testset', 'vis_imgs', '*.pth', '*.npy', 'python*', 'uv*']
         shutil.copytree('../hsam_code', code_dir, ignore=shutil.ignore_patterns(*ignore_patterns))
 
     # register model
@@ -218,13 +256,44 @@ if __name__ == "__main__":
         sam2 = build_sam2(model_cfg, checkpoint)
         image_size = sam2.image_size
 
-        if args.ours_use_lora:  # Todo: 需要修改代码
-            pkg = import_module(args.module)
-            sam2 = pkg.LoRA_Sam(sam2, args.rank).cuda()
-            sam2.image_size = image_size
-            sam2.device = 'cuda'
+        # 测试lora_sam2
+        pkg = import_module(args.module)
 
-        net = SAM2ImagePredictor(sam2)
+        if args.ours_use_lora:
+            from sam2_lora import add_lora_to_sam2, LoRA_Adapter
+            # 第一种
+            # target_modules = [name for name, _ in sam2.named_modules()]
+            # include = 'image_encoder'
+            # exclude = None
+            # target_modules = [name for name in target_modules if include in name] if include else target_modules
+            # target_modules = [name for name in target_modules if exclude not in name] if exclude else target_modules
+            # sam2 = add_lora_to_sam2(
+            #     model=sam2,
+            #     r=4,
+            #     lora_alpha=1.0,
+            #     lora_target_modules=target_modules,
+            #     verbose=True
+            # )
+            # sam2.print_trainable_parameters()
+
+            # 第二种, 梯度没问题, 但是应用的是 HSAM 中的 注意力 lora
+            # sam2 = pkg.LoRA_Sam2(sam2, args.rank).sam
+            # net = SAM2ImagePredictor(sam2)
+            # 保存 lora 参数
+
+            # # 第三种
+            # sam2 = LoRA_Adapter(sam2, args.rank, lora_alpha=1., lora_target_modules=target_modules)
+            # sam2.image_size = image_size
+            # # print('\n'.join([name for name, p in lora_sam2_model.named_parameters() if p.requires_grad]))
+            # net = SAM2ImagePredictor(sam2)
+            # LoRA_Adapter.set_trainable_para(net.model, original_linear=False)
+
+            # 第四种, 梯度没问题, 对所有线性层使用 lora
+            sam2 = pkg.LoRA_Sam3(sam2, rank=4, target_modules=["Linear"])
+            net = SAM2ImagePredictor(sam2.model)
+            save_func = pkg.LoRA_Sam3.save_lora_weights
+            load_func = pkg.LoRA_Sam3.load_lora_weights # sum(p.numel() for n, p in torch.load(pth).items())
+            args.utils = {'save_func': save_func, 'load_func': load_func}
 
         # 沿用 hsam 的设置
         img_embedding_size = 14
@@ -246,3 +315,4 @@ if __name__ == "__main__":
 
     trainer = {'Synapse': trainer_synapse}
     trainer[dataset_name](args, net, snapshot_path, multimask_output, low_res)
+    let_me_know(f'Finish', 'SAM-Exps')
