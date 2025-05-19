@@ -119,7 +119,7 @@ parser.add_argument('--only_train_unet', action='store_true', help='是否要进
 args = parser.parse_args()
 
 if args.debug:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     args.n_gpu = int(torch.cuda.device_count())
     if args.model == 'sam2':
         args.root_path = '/database/wuyonghuang/hsam_code/data/multi-organ-CT/train_npz_512/'
@@ -261,32 +261,10 @@ if __name__ == "__main__":
 
         if args.ours_use_lora:
             from sam2_lora import add_lora_to_sam2, LoRA_Adapter
-            # 第一种
-            # target_modules = [name for name, _ in sam2.named_modules()]
-            # include = 'image_encoder'
-            # exclude = None
-            # target_modules = [name for name in target_modules if include in name] if include else target_modules
-            # target_modules = [name for name in target_modules if exclude not in name] if exclude else target_modules
-            # sam2 = add_lora_to_sam2(
-            #     model=sam2,
-            #     r=4,
-            #     lora_alpha=1.0,
-            #     lora_target_modules=target_modules,
-            #     verbose=True
-            # )
-            # sam2.print_trainable_parameters()
-
             # 第二种, 梯度没问题, 但是应用的是 HSAM 中的 注意力 lora
             # sam2 = pkg.LoRA_Sam2(sam2, args.rank).sam
             # net = SAM2ImagePredictor(sam2)
             # 保存 lora 参数
-
-            # # 第三种
-            # sam2 = LoRA_Adapter(sam2, args.rank, lora_alpha=1., lora_target_modules=target_modules)
-            # sam2.image_size = image_size
-            # # print('\n'.join([name for name, p in lora_sam2_model.named_parameters() if p.requires_grad]))
-            # net = SAM2ImagePredictor(sam2)
-            # LoRA_Adapter.set_trainable_para(net.model, original_linear=False)
 
             # 第四种, 梯度没问题, 对所有线性层使用 lora
             sam2 = pkg.LoRA_Sam3(sam2, rank=4, target_modules=["Linear"])
@@ -294,6 +272,9 @@ if __name__ == "__main__":
             save_func = pkg.LoRA_Sam3.save_lora_weights
             load_func = pkg.LoRA_Sam3.load_lora_weights # sum(p.numel() for n, p in torch.load(pth).items())
             args.utils = {'save_func': save_func, 'load_func': load_func}
+        
+        else:
+            net = SAM2ImagePredictor(sam2)
 
         # 沿用 hsam 的设置
         img_embedding_size = 14
