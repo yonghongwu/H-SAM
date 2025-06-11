@@ -97,6 +97,7 @@ def vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_
 
 @torch.no_grad()
 def vanilla_eva(model, image_batch, label_batch, num_prompts_per_class=3, args=None, **kwargs):
+    device = image_batch.device
     batch_losses, batch_ious = [], []
     all_iou_scores_semi = {} # Stores list of IoUs for each class label
     all_dice_scores_semi = {} # Stores list of Dice scores for each class label
@@ -140,19 +141,25 @@ def vanilla_eva(model, image_batch, label_batch, num_prompts_per_class=3, args=N
         if label.mean() == 0: continue
 
         # 获取 prompts、二值化的多类别掩码
-        prompts = generate_prompts_from_semantic_mask(
-            label,
-            class_ids=None,  # 处理所有类别
-            num_positive_points=1,
-            num_negative_points=0,
-            num_prompts_per_class=num_prompts_per_class,  # 每个类别生成3组prompt
-            point_sampling_strategy="center_weighted",
-            box_noise_level=0.1,
-            generate_box=True,
-            generate_points=True
-        )
+        if args.dataset  == 'Synapse':
+            prompts = generate_prompts_from_semantic_mask(
+                label,
+                class_ids=None,  # 处理所有类别
+                num_positive_points=1,
+                num_negative_points=0,
+                num_prompts_per_class=num_prompts_per_class,  # 每个类别生成3组prompt
+                point_sampling_strategy="center_weighted",
+                box_noise_level=0.1,
+                generate_box=True,
+                generate_points=True
+            )
+            decoded_mask = get_decoded_mask(prompts['decoded_mask'], num_prompts_per_class=num_prompts_per_class)
 
-        decoded_mask = get_decoded_mask(prompts['decoded_mask'], num_prompts_per_class=num_prompts_per_class)
+        elif args.dataset == 'PanNuke':
+            prompts = kwargs['new_test_prompts']
+            decoded_mask = torch.from_numpy(prompts['decoded_mask'][1])[None].to(device)
+        
+        else: raise ValueError
 
         # 函数: 接受 image、point、model, 输出 prediction
         model.set_image(image)
@@ -478,18 +485,28 @@ def train_with_po(model, optimizer, scaler, image_batch, label_batch, num_prompt
     all_rewards = []
     idx_count = 0
 
-    if len(kwargs) != 0:
+    if len(kwargs) != 0 and kwargs.get('semi', None):
         assert args.semi == True
         image_batch_un = kwargs['image_un']
         label_batch_un = kwargs['label_un']
     
     for idx, (image_idx, label_idx) in enumerate(zip(range(image_batch.shape[0]), range(label_batch.shape[0]))):    # 假设 有标注数据和未标注数据的比例是 1:1
+        device = image_batch.device
         image_idx_in_all_trainset = iteration * image_batch.shape[0] + idx_count
         image, label = image_batch[image_idx].permute(1, 2, 0).cpu().numpy(), label_batch[label_idx].cpu().numpy()
+        if label.sum()  == 0: continue
         
         idx_count += 1
 
-        if args.semi:
+        if isinstance(args.pos_point_num, tuple):
+            num_pos_points = np.random.randint(*args.pos_point_num, size=(1))[0]
+        else: num_pos_points = args.pos_point_num
+        if isinstance(args.neg_point_num, tuple):
+            num_neg_points = np.random.randint(*args.neg_point_num, size=(1))[0]
+        else: num_neg_points = args.neg_point_num
+
+        if args.semi:   # note: 设置在一定的iteration之后再进行半监督,提供一定的稳定性
+            image_un_npy = image_batch_un[image_idx].permute(1, 2, 0).cpu().numpy()
             image_un = image_batch_un[image_idx:image_idx+1]
             pred_un = kwargs['net_semi'](image_un[:, 0:1])  # 只使用2D slice的第一个通道(其实三个通道的信息是一样的, 因为这是医学数据); shape: (B, cls, H, W)
             # note: 半监督算法在视觉上的常见算法: MT\Fixmatch, 这里要新的半监督算法: 基于DPO来实现半监督, 可以使用正则化来提供额外的监督
@@ -497,36 +514,62 @@ def train_with_po(model, optimizer, scaler, image_batch, label_batch, num_prompt
             from semi_utils import process_segmentation_output
             mask_un = process_segmentation_output(output_tensor=pred_un)
 
-            # TODO: 生成 prompt
+            pseudo_prompts = generate_prompts_from_semantic_mask(
+                mask_un,
+                class_ids=None,
+                num_positive_points=num_pos_points,
+                num_negative_points=num_neg_points,
+                num_prompts_per_class=num_prompts_per_class,
+                point_sampling_strategy="center_weighted",
+                box_noise_level=0.1,
+                generate_box=True,
+                generate_points=True,
+                is_strict=args.is_strict
+            )
 
-            # TODO: 输入给 actor 和 ref_model
+            # 1. 将 prompt 输入给 actor 以利用 未标注数据
+            model.set_image(image_un_npy)
+            pseudo_results = get_prompt_preds(
+                model, pseudo_prompts, prompt_mode='box',     # TODO: 这里的低质量 掩码应该生成 point 还是 box prompt ? 先使用 box prompt
+                multimask_output=True, 
+                only_best_score_pred=args.onlybest_in_multimask_output, 
+                only_save_best_prompt_pred=False,
+            )
+            
+            pseudo_logits, pseudo_scores, pseudo_category_indices = concatenate_masks_and_scores_v2(
+                pseudo_results['prompts_preds'], sort_keys=True
+            )
+
+            # 2. TODO: actor 输出分割结果作为 GT 来监督 unet 模型; unet 用 mask_un 监督 actor 模型
+            pseudo_logits = rearrange(pseudo_logits, '(b n) h w -> b n h w', n=args.num_prompts_per_class)
+            pseudo_logprobs = F.logsigmoid(pseudo_logits)
+
+            # policy_chosen_logps = torch.gather(policy_logprobs, dim=1, index=chosen_indices) # Shape: (mbatch_size, 1, height, width)
+            # criterion(policy_logprobs.squeeze(1), gt_masks.float().cuda()[::args.num_prompts_per_class]) 
         
-        if isinstance(args.pos_point_num, tuple):
-            num_pos_points = np.random.randint(*args.pos_point_num, size=(1))[0]
-        else: num_pos_points = args.pos_point_num
-        if isinstance(args.neg_point_num, tuple):
-            num_neg_points = np.random.randint(*args.neg_point_num, size=(1))[0]
-        else: num_neg_points = args.neg_point_num
+        if args.dataset == 'Synapse':
+            # 获取prompts和GT掩码 (与原代码相同)
+            prompts = generate_prompts_from_semantic_mask(
+                label,
+                class_ids=None,
+                num_positive_points=num_pos_points,
+                num_negative_points=num_neg_points,
+                num_prompts_per_class=num_prompts_per_class,
+                point_sampling_strategy="center_weighted",
+                box_noise_level=0.1,
+                generate_box=True,
+                generate_points=True,
+                is_strict=args.is_strict
+            )   # {class_prompts: {cls1: [ {box_prompt: [x1, x2, y1, y2], point_prompts: { (x1, y1, pos), (x2, y2, neg), (...), ... } } , ..., ..., ] } , ...}
         
-        # 获取prompts和GT掩码 (与原代码相同)
-        prompts = generate_prompts_from_semantic_mask(
-            label,
-            class_ids=None,
-            num_positive_points=num_pos_points,
-            num_negative_points=num_neg_points,
-            num_prompts_per_class=num_prompts_per_class,
-            point_sampling_strategy="center_weighted",
-            box_noise_level=0.1,
-            generate_box=True,
-            generate_points=True,
-            is_strict=args.is_strict
-        )
-        
-        decoded_mask = prompts['decoded_mask']
-        class_keys = sorted(decoded_mask.keys())
-        for key in class_keys:
-            decoded_mask[key] = torch.from_numpy(decoded_mask[key])[None].long().repeat(num_prompts_per_class, 1, 1)
-        decoded_mask = torch.concat(list(decoded_mask.values()), dim=0).cuda()
+            decoded_mask = prompts['decoded_mask']
+            class_keys = sorted(decoded_mask.keys())
+            for key in class_keys:
+                decoded_mask[key] = torch.from_numpy(decoded_mask[key])[None].long().repeat(num_prompts_per_class, 1, 1)
+            decoded_mask = torch.concat(list(decoded_mask.values()), dim=0).cuda()
+        elif args.dataset == 'PanNuke':
+            prompts, prompts2 = kwargs['new_prompts'], kwargs['new_prompts2']
+            decoded_mask = torch.from_numpy(prompts['decoded_mask'][1])[None].to(device)
         
         # 设置图像
         model.set_image(image)
@@ -554,18 +597,23 @@ def train_with_po(model, optimizer, scaler, image_batch, label_batch, num_prompt
                 if isinstance(args.kl_neg_point_num, tuple):
                     kl_num_neg_points = np.random.randint(*args.kl_neg_point_num, size=(1))[0]
                 else: kl_num_neg_points = args.kl_neg_point_num
-                prompts = generate_prompts_from_semantic_mask(
-                    label,
-                    class_ids=None,
-                    num_positive_points=kl_num_pos_points,
-                    num_negative_points=kl_num_neg_points,
-                    num_prompts_per_class=num_prompts_per_class,
-                    point_sampling_strategy="center_weighted",
-                    box_noise_level=0.01,
-                    generate_box=True,
-                    generate_points=True,
-                    is_strict=args.kl_is_strict
-                )
+
+                if args.dataset == 'Synapse':
+                    prompts = generate_prompts_from_semantic_mask(
+                        label,
+                        class_ids=None,
+                        num_positive_points=kl_num_pos_points,
+                        num_negative_points=kl_num_neg_points,
+                        num_prompts_per_class=num_prompts_per_class,
+                        point_sampling_strategy="center_weighted",
+                        box_noise_level=0.01,
+                        generate_box=True,
+                        generate_points=True,
+                        is_strict=args.kl_is_strict
+                    )
+                elif args.dataset == 'PanNuke':
+                    prompts = prompts2
+                else: raise ValueError
             else: pass
 
             ref_results = get_prompt_preds(
@@ -602,7 +650,7 @@ def train_with_po(model, optimizer, scaler, image_batch, label_batch, num_prompt
             log_structured_rewards_stats(rewards1, num_prompts_per_class, step=image_idx_in_all_trainset, logger=writer, class_keys=class_keys, name='rewards1')
             log_structured_rewards_stats(rewards2, num_prompts_per_class, step=image_idx_in_all_trainset, logger=writer, class_keys=class_keys, name='rewards2')
 
-        else:
+        else:   # require: compute_reward( torch.randn(-1, H, w), torch.randn(-1, H, w))
             rewards = normalize_in_chunks_v2(compute_reward_v2(adaptive_pool(current_logits), decoded_mask.float()), chunk_size=num_prompts_per_class, temperature=args.rw_temp)   # 向量
         
         if args.grpo_KL_weight:

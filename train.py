@@ -16,7 +16,7 @@ from importlib import import_module
 from sam_lora_image_encoder import LoRA_Sam
 from segment_anything import sam_model_registry
 
-from trainer import trainer_synapse
+from trainer import trainer_synapse, trainer_pannuke
 from icecream import ic
 from sende import let_me_know
 
@@ -34,7 +34,7 @@ parser.add_argument('--root_path', type=str,
                     default='/data2/zhcheng/train_npz_224', help='root dir for data')
 parser.add_argument('--output', type=str, default='./output')
 parser.add_argument('--dataset', type=str,
-                    default='Synapse', help='experiment_name')
+                    default='Synapse', help='[Synapse, PanNuke]')
 parser.add_argument('--list_dir', type=str,
                     default='./lists/lists_Synapse', help='list dir')
 parser.add_argument('--split', type=str,
@@ -124,6 +124,8 @@ if args.debug:
     if args.model == 'sam2':
         args.root_path = '/database/wuyonghuang/hsam_code/data/multi-organ-CT/train_npz_512/'
 
+        args.dataset = 'PanNuke'
+
         # GRPO 训练的设置
         # args.is_grpo = True
         # args.rw_dispered = False
@@ -139,7 +141,7 @@ if args.debug:
         args.onlybest_in_multimask_output = False
         args.ours_use_lora = True
 
-        args.semi = True    # TODO: 调试一下半监督
+        args.semi = False    # Todo: 半监督方法, 开发中
         args.semi_ratio = 0.1
         args.use_unet = True   # 默认使用 unet 模型
 
@@ -254,7 +256,6 @@ if __name__ == "__main__":
             model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
         else: raise ValueError
         sam2 = build_sam2(model_cfg, checkpoint)
-        image_size = sam2.image_size
 
         # 测试lora_sam2
         pkg = import_module(args.module)
@@ -294,6 +295,6 @@ if __name__ == "__main__":
     with open(config_file, 'w') as f:
         f.writelines(config_items)
 
-    trainer = {'Synapse': trainer_synapse}
+    trainer = {'Synapse': trainer_synapse, 'PanNuke': trainer_pannuke}
     trainer[dataset_name](args, net, snapshot_path, multimask_output, low_res)
     let_me_know(f'Finish', 'SAM-Exps')
