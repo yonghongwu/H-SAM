@@ -1,6 +1,9 @@
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+from PIL import Image
 
 
 def organize_prompts(prompts):
@@ -94,6 +97,72 @@ def plot_results_np(images: np.ndarray, prompts_img:np.ndarray, preds: np.ndarra
         axs[3].imshow(masks[idx]); axs[3].set_title('mask')
         plt.savefig(save_paths[idx]) if save_paths is not None else None
         plt.close()
+
+
+def plot_points_on_image(img, points, boxes=None):
+    """
+    针对test_prompts获取的内容, 在图像上绘制点
+    
+    Args:
+        image_path: 图像文件路径
+        points: 点的列表，格式为[(x1, y1, c1), (x2, y2, c2), ...]
+    """
+    # 读取图像
+    # img = Image.open(image_path)
+    
+    # 创建图形
+    plt.figure(figsize=(10, 8))
+    plt.imshow(img)
+
+        # 绘制边界框（如果提供）
+    if boxes is not None:
+        for i, (x1, y1, x2, y2) in enumerate(boxes):
+            # 计算宽度和高度
+            width = x2 - x1
+            height = y2 - y1
+            
+            # 创建矩形框
+            rect = patches.Rectangle((x1, y1), width, height,
+                                   linewidth=2, edgecolor='blue', 
+                                   facecolor='none', alpha=0.8)
+            plt.gca().add_patch(rect)
+            
+            # 添加框的标签
+            plt.text(x1, y1-5, f'Box {i+1}', 
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='blue', alpha=0.7),
+                    fontsize=10, color='white', fontweight='bold')
+
+    
+    # 分离正负样本点
+    positive_points = [(x, y) for x, y, c in points if c == 1]
+    negative_points = [(x, y) for x, y, c in points if c == 0]
+    
+    # 绘制正样本点（绿色）
+    if positive_points:
+        pos_x, pos_y = zip(*positive_points)
+        plt.scatter(pos_x, pos_y, c='green', marker='o', s=50, 
+                   label='Positive samples', alpha=0.8)
+    
+    # 绘制负样本点（红色）
+    if negative_points:
+        neg_x, neg_y = zip(*negative_points)
+        plt.scatter(neg_x, neg_y, c='red', marker='x', s=50, 
+                   label='Negative samples', alpha=0.8)
+    
+    plt.legend()
+    plt.title('Points on Image')
+    plt.axis('off')  # 隐藏坐标轴
+    plt.tight_layout()
+    plt.savefig('test.png')
+    plt.show()
+
+# 使用示例
+# points = [(100, 150, 1), (200, 300, 0), (50, 80, 1), (180, 250, 0)]
+# plot_points_on_image('your_image.jpg', points)
+# points = test_prompts['prompts'][0]['point_prompts']
+# boxes = test_prompts['prompts'][0]['box_prompts']
+# image = Image.fromarray(test_prompts['image'])
+# plot_points_on_image(image, points, [boxes])
 
 
 if __name__ == '__main__':

@@ -14,7 +14,7 @@ import torch.backends.cudnn as cudnn
 from utils import test_single_volume
 from importlib import import_module
 from segment_anything import sam_model_registry
-from datasets.dataset_synapse import Synapse_dataset
+from dataset.dataset_synapse import Synapse_dataset
 
 from icecream import ic
 
@@ -96,6 +96,7 @@ if __name__ == '__main__':
     parser.add_argument('--neg_point_num', type=parse_str, default='0', help='')
 
     parser.add_argument('--num_prompts_per_class', type=int, default=1, help='对于一张图像, 会采样出多少个prompt, 等于GRPO组的大小; 区别于 train, 这里设置为 1')
+    parser.add_argument('--ours_use_lora', action='store_true', help='我们的方法是否使用lora')
 
     parser.add_argument('--debug', '-d', action='store_true', help='If activated, debug mode is activated')
 
@@ -104,10 +105,14 @@ if __name__ == '__main__':
     if args.debug:
         args.lora_ckpt = None   # '/database/wuyonghuang/hsam_code/220_epoch_299.pth'
         args.vit_name = 'vit_b'
-        args.ckpt = '/database/wuyonghuang/hsam_code/output/EXPS1/exp1/sam2-dpo/20250317_175612_Synapse_224_pretrain_vit_b_epo20_bs8_lr0.0001_s2345/epoch_000_loss-0.0359201457661887_iou-0.6986421409994364.pth' # 'checkpoints/sam_vit_b_01ec64.pth'
+        # args.ckpt = '/database/wuyonghuang/hsam_code/output/EXPS1/exp1/sam2-dpo/20250317_175612_Synapse_224_pretrain_vit_b_epo20_bs8_lr0.0001_s2345/epoch_000_loss-0.0359201457661887_iou-0.6986421409994364.pth' # 'checkpoints/sam_vit_b_01ec64.pth'
+        args.ckpt = '/database/wuyonghuang/hsam_code/output/lora_dpo_weight_exp/exp1-onlybest_in_multimask_output/sam2-dpo/20250519_150520_Synapse_224_pretrain_vit_b_epo5_bs8_lr0.0001_s2345/epoch_003-loss_0.0201-iou_0.7664_lora.pth'
         args.stage = 3
-        args.img_size = 224
+        args.img_size = 512
         args.model = 'sam2'
+        args.pos_point_num = 3
+
+        args.ours_use_lora = True
 
     if args.config is not None:
         # overwtite default configurations with config file\
@@ -183,10 +188,29 @@ if __name__ == '__main__':
 
         sam2 = build_sam2(model_cfg, checkpoint)
 
-        if args.ckpt is not None:
-            sam2.load_state_dict(torch.load(args.ckpt))
-            print('成功加载参数')
-        net = SAM2ImagePredictor(sam2)
+        # 测试lora_sam2
+        pkg = import_module(args.module)
+
+        if args.ours_use_lora:
+            from sam2_lora import add_lora_to_sam2, LoRA_Adapter
+            # 第二种, 梯度没问题, 但是应用的是 HSAM 中的 注意力 lora
+            # sam2 = pkg.LoRA_Sam2(sam2, args.rank).sam
+            # net = SAM2ImagePredictor(sam2)
+            # 保存 lora 参数
+
+            # 第四种, 梯度没问题, 对所有线性层使用 lora
+            sam2 = pkg.LoRA_Sam3(sam2, rank=4, target_modules=["Linear"])
+            net = SAM2ImagePredictor(sam2.model)
+            save_func = pkg.LoRA_Sam3.save_lora_weights
+            load_func = pkg.LoRA_Sam3.load_lora_weights # sum(p.numel() for n, p in torch.load(pth).items())
+            args.utils = {'save_func': save_func, 'load_func': load_func}
+            args.utils['load_func'](net.model, args.ckpt)
+        else:
+            if args.ckpt is not None:
+                sam2.load_state_dict(torch.load(args.ckpt))
+                print('成功加载参数')
+            net = SAM2ImagePredictor(sam2)
+
         img_embedding_size = 14
 
     else: raise ValueError

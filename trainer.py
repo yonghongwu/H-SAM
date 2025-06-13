@@ -315,7 +315,7 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                 images, labels, name = test_case['image'], test_case['label'], test_case['case_name']   # (slices, 512, 512), (slices, 512, 512), string
                 infer_loss, infer_iou = 0, 0
                 infer_loss, infer_iou, net_semi_res = vanilla_eva(model, 
-                                                                  torch.from_numpy(images.astype(np.float32)).unsqueeze(1).repeat(1, 3, 1, 1), 
+                                                                  torch.from_numpy(images).unsqueeze(1).repeat(1, 3, 1, 1), # .astype(np.float32)
                                                                   torch.from_numpy(labels), num_prompts_per_class=1, args=args, **kwargs)
                 infer_losses.append(infer_loss), infer_ious.append(infer_iou)
                 infer_netsemi_iou.append(net_semi_res[0]), infer_netsemi_dice.append(net_semi_res[1])
@@ -500,7 +500,7 @@ def trainer_pannuke(args, model, snapshot_path, multimask_output, low_res):
                 num_neg_points = np.random.randint(*args.neg_point_num, size=(1))[0]
             else: num_neg_points = args.neg_point_num
 
-            prompts = demo_usage(sample, mode='all_nuclei', num_positive_points=num_pos_points, num_negative_points=num_neg_points, num_batches=num_prompts_per_class) # 'all_nuclei' or 'specific_category'
+            prompts = demo_usage(sample, mode='all_nuclei', num_positive_points=num_pos_points, num_negative_points=num_neg_points, num_batches=num_prompts_per_class, all_instance_mode=True) # 'all_nuclei' or 'specific_category'
             prompts2 = demo_usage(sample, mode='all_nuclei', num_positive_points=100, num_negative_points=100, num_batches=num_prompts_per_class, all_instance_mode=True) # 'all_nuclei' or 'specific_category'
             if prompts is None or prompts2 is None: continue
             new_prompts = {'class_prompts':
@@ -588,12 +588,13 @@ def trainer_pannuke(args, model, snapshot_path, multimask_output, low_res):
             if args.debug and i_batch == 0:
                 break
 
-        save_interval = args.interval_epoch # int(max_epoch/6) Todo: 增加参数
+        save_interval = args.interval_epoch # int(max_epoch/6)
         if args.debug or (epoch_num + 1) % save_interval == 0:
             infer_losses, infer_ious, infer_netsemi_iou, infer_netsemi_dice = [], [], [], []
             for test_case in db_test:
                 # images, labels, name = test_case['image'], test_case['label'], test_case['case_name']   # (slices, 512, 512), (slices, 512, 512), string
-                test_prompts = demo_usage(test_case, mode='all_nuclei', num_positive_points=3, num_negative_points=4, num_batches=1) # 'all_nuclei' or 'specific_category'
+                test_prompts = demo_usage(test_case, mode='all_nuclei', num_positive_points=2, num_negative_points=0, num_batches=1, all_instance_mode=True) # 'all_nuclei' or 'specific_category'
+                if test_prompts is None: continue
                 new_test_prompts = {'class_prompts': {1: test_prompts['prompts']},
                                'decoded_mask': {1: test_prompts['target_mask']}}
                 kwargs.update({'test_prompts': test_prompts, 'new_test_prompts': new_test_prompts})
@@ -602,9 +603,9 @@ def trainer_pannuke(args, model, snapshot_path, multimask_output, low_res):
                 labels = test_prompts['target_mask'] # (256, 256)
 
                 infer_loss, infer_iou = 0, 0
-                infer_loss, infer_iou, net_semi_res = vanilla_eva(model, 
-                                                                #   torch.from_numpy(images.astype(np.float32)).unsqueeze(1).repeat(1, 3, 1, 1), # Synapse的处理方式
-                                                                  torch.from_numpy(images.astype(np.float32))[None].permute(0, 3, 1, 2),
+                infer_loss, infer_iou, net_semi_res = vanilla_eva(model,
+                                                                  # torch.from_numpy(images.astype(np.float32)).unsqueeze(1).repeat(1, 3, 1, 1), # Synapse的处理方式
+                                                                  torch.from_numpy(images)[None].permute(0, 3, 1, 2),
                                                                   torch.from_numpy(labels)[None], num_prompts_per_class=1, args=args, **kwargs)
                 infer_losses.append(infer_loss), infer_ious.append(infer_iou)
                 infer_netsemi_iou.append(net_semi_res[0]), infer_netsemi_dice.append(net_semi_res[1])

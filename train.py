@@ -126,6 +126,9 @@ if args.debug:
 
         args.dataset = 'PanNuke'
 
+        args.pos_point_num = (1, 5)
+        args.neg_point_num = (0, 5)
+
         # GRPO 训练的设置
         # args.is_grpo = True
         # args.rw_dispered = False
@@ -135,6 +138,7 @@ if args.debug:
 
         # DPO 训练的设置
         args.is_dpo = True
+        # args.abla_dpo = True
 
         # args.dev = True
 

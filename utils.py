@@ -240,8 +240,11 @@ def calculate_metric_percase(pred, gt):
 
 def test_single_volume(image, label, net, classes, multimask_output, patch_size=[256, 256], input_size=[224, 224],
                        test_save_path=None, case=None, z_spacing=1, stage=2, mode='test', model='hsam', save_nii=False, args=None):
-    num_prompts_per_class = 1
+    args.num_prompts_per_class = 1
     lab = label.squeeze(0)
+    net.model.eval()
+    net.model.cuda()
+
     image, label = image.squeeze(0).cpu().detach().numpy(), label.squeeze(0).cpu().detach().numpy()
     if len(image.shape) == 3:
         prediction = np.zeros_like(label)
@@ -316,7 +319,7 @@ def test_single_volume(image, label, net, classes, multimask_output, patch_size=
                     )
 
                     # # 按照decoded_mask的键的顺序进行排序，然后将值重复三次再全部拼接起来。
-                    decoded_mask = get_decoded_mask(prompts['decoded_mask'], num_prompts_per_class=num_prompts_per_class)
+                    decoded_mask = get_decoded_mask(prompts['decoded_mask'], num_prompts_per_class=args.num_prompts_per_class)
                     net.set_image(idx_image)
                     results = get_prompt_preds(net, prompts, prompt_mode=args.prompt_type, multimask_output=True, only_best_score_pred=True, only_save_best_prompt_pred=False)
                     all_logits, all_scores, category_indices = concatenate_masks_and_scores_v2(results['prompts_preds'], sort_keys=True)
