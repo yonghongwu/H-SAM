@@ -182,7 +182,7 @@ class DiceLoss(nn.Module):
 #     """计算Hausdorff Distance 95%"""
 #     pred_points = np.argwhere(pred > 0)
 #     gt_points = np.argwhere(gt > 0)
-#     if len(pred_points) == 0 or len(gt_points) == 0:  # 如果某个为空集，返回最大值
+#     if len(pred_points) == 0 or len(gt_points) == 0:  # 如果某个为空集, 返回最大值
 #         return np.inf
 #     forward_hd = directed_hausdorff(pred_points, gt_points)[0]
 #     backward_hd = directed_hausdorff(gt_points, pred_points)[0]
@@ -198,7 +198,7 @@ class DiceLoss(nn.Module):
 #         hd95 = calculate_hd95(pred, gt)
 #         return dice, hd95
 #     elif pred.sum() > 0 and gt.sum() == 0:
-#         return 1, np.inf  # 如果gt没东西，HD95返回正无穷
+#         return 1, np.inf  # 如果gt没东西, HD95返回正无穷
 #     else:
 #         return 0, np.inf  # 如果pred和gt都没东西
 
@@ -318,7 +318,7 @@ def test_single_volume(image, label, net, classes, multimask_output, patch_size=
                         is_strict=args.point_strict
                     )
 
-                    # # 按照decoded_mask的键的顺序进行排序，然后将值重复三次再全部拼接起来。
+                    # # 按照decoded_mask的键的顺序进行排序, 然后将值重复三次再全部拼接起来。
                     decoded_mask = get_decoded_mask(prompts['decoded_mask'], num_prompts_per_class=args.num_prompts_per_class)
                     net.set_image(idx_image)
                     results = get_prompt_preds(net, prompts, prompt_mode=args.prompt_type, multimask_output=True, only_best_score_pred=True, only_save_best_prompt_pred=False)
@@ -448,3 +448,60 @@ def get_decoded_mask(decoded_mask, num_prompts_per_class):
         decoded_mask[key] = torch.from_numpy(decoded_mask[key])[None].long().repeat(num_prompts_per_class, 1, 1)
     decoded_mask = torch.concat(list(decoded_mask.values()), dim=0)
     return decoded_mask
+
+
+def process_list_A(A):
+    """
+    处理列表A, 将其转换为三个列表, 用于批量训练
+    
+    Args:
+        A: 长度为L的列表, 每个元素是长度为L2的列表B, 
+           B中每个元素是包含"point_prompts"和"box_prompts"的字典
+    
+    Returns:
+        tuple: (coordinates_list, labels_list, boxes_list)
+    """
+    L = len(A)
+    coordinates_list = []
+    labels_list = []
+    boxes_list = []
+    
+    for i in range(L):
+        B = A[i]  # 长度为L2的列表
+        L2 = len(B)
+        
+        # 获取第一个字典来确定N的大小
+        if L2 > 0 and "point_prompts" in B[0]:
+            N = len(B[0]["point_prompts"])
+        else:
+            N = 0
+        
+        # 初始化当前批次的数组
+        coordinates = np.zeros((L2, N, 2))  # (L2, N, 2)
+        labels = np.zeros((L2, N))          # (L2, N)
+        boxes = np.zeros((L2, 4))           # (L2, 4)
+        
+        # 处理每个字典
+        for j in range(L2):
+            dict_item = B[j]
+            
+            # 处理point_prompts
+            if "point_prompts" in dict_item:
+                point_prompts = dict_item["point_prompts"]
+                for k, (x, y, c) in enumerate(point_prompts):
+                    if k < N:  # 防止索引越界
+                        coordinates[j, k, 0] = x
+                        coordinates[j, k, 1] = y
+                        labels[j, k] = c
+            
+            # 处理box_prompts
+            if "box_prompts" in dict_item:
+                box_prompts = dict_item["box_prompts"]
+                if len(box_prompts) >= 4:  # 确保有足够的坐标
+                    boxes[j, :] = box_prompts[:4]  # 取前4个值
+        
+        coordinates_list.append(coordinates)
+        labels_list.append(labels)
+        boxes_list.append(boxes)
+    
+    return coordinates_list, labels_list, boxes_list

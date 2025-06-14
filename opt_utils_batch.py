@@ -10,7 +10,6 @@ from tqdm import tqdm
 from einops import rearrange
 from collections import defaultdict
 from utils import get_decoded_mask
-from plot_utils import plot_results_np, draw_prompts_on_image, organize_prompts
 from gen_prompt import generate_prompts_from_semantic_mask, get_prompt_preds, concatenate_masks_and_scores_v2, plot_results
 
 
@@ -683,6 +682,7 @@ def train_with_po(model, optimizer, scaler, image_batch, label_batch, num_prompt
 
         # 绘图
         if args is not None and args.debug:
+            from plot_utils import plot_results_np, draw_prompts_on_image, organize_prompts
             organized_prompts, (class_box_prompts, class_point_prompts)  = organize_prompts(prompts)
             all_prompts_vis_imgs = []
             for i_cls in sorted(list(organized_prompts.keys())):
@@ -720,6 +720,163 @@ def train_with_po(model, optimizer, scaler, image_batch, label_batch, num_prompt
         print(f"GRPO Loss: {total_loss.item():.4f}, Avg Reward: {avg_reward:.4f}")
         
         return total_loss.item(), avg_reward
+    
+    return 0, 0
+
+
+# 假设你已经有了一个新的批处理辅助函数
+def get_batched_prompt_preds(model, image_batch, prompts_batch):
+    batched_logits, batched_scores = None, None
+    return batched_logits, batched_scores, ...
+
+def none_func(*args, **kwargs):
+    # 介绍如何在批量的情况下, 使用SAM2进行推理: 多个图像, 每个图像多组, 每组可以包含 point 和 box prompts
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+    checkpoint = "/database/wuyonghuang/hsam_code/sam2-main/checkpoints/sam2.1_hiera_base_plus.pt"
+    model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"    # 这个是安装的时候写的, 不是相对路径
+    sam2 = build_sam2(model_cfg, checkpoint)
+    predictor = SAM2ImagePredictor(sam2)
+
+    from PIL import Image
+    image1 = Image.open('/database/wuyonghuang/hsam_code/vis_imgs/truck.jpg')
+    image1 = np.array(image1.convert("RGB"))
+    image1_pts = np.array([
+        [[500, 375]],
+        [[650, 750]]
+        ]) # Bx1x2 where B corresponds to number of objects 
+    image1_labels = np.array([[1], [1]])
+    image1_boxes = np.array([
+        [75, 275, 1725, 850],
+        [425, 600, 700, 875],
+        # [1375, 550, 1650, 800],
+        # [1240, 675, 1400, 750],
+    ])
+
+    image2 = Image.open('/database/wuyonghuang/hsam_code/vis_imgs/groceries.jpg')
+    image2 = np.array(image2.convert("RGB"))
+    image2_pts = np.array([
+        [[400, 300]],
+        [[630, 300]],
+    ])
+    image2_labels = np.array([[1], [1]])
+    image2_boxes = np.array([
+        [450, 170, 520, 350],
+        [350, 190, 450, 350],
+        # [500, 170, 580, 350],
+        # [580, 170, 640, 350],
+    ])
+
+    img_batch = [image1, image2]
+    pts_batch = [image1_pts, image2_pts]
+    labels_batch = [image1_labels, image2_labels]
+    boxes_batch = [image1_boxes, image2_boxes]
+
+    predictor.set_image_batch(img_batch)
+
+    masks_batch, scores_batch, _ = predictor.predict_batch(pts_batch, labels_batch, box_batch=None, multimask_output=True)
+
+
+def train_with_po_batched(model, optimizer, scaler, batch_data, num_prompts_per_class=3, beta=0.05, iteration=0, writer=None, args=None, **kwargs):
+    # 0. 初始化参考模型 (逻辑不变)
+    if not hasattr(train_with_po_batched, 'ref_model'):
+        train_with_po_batched.ref_model = create_reference_model(model)
+    ref_model = train_with_po_batched.ref_model
+
+    # 1. 从批次数据中获取张量 (由collate_fn准备好)
+    # image_batch = batch_data['image_batch'].cuda()  # (B, C, H, W)
+    # label_batch = batch_data['label_batch'].cuda()  # (B, H, W)
+
+
+    # note: 传入一个字典, 处理出 prompts_batch 和 decoded_mask_batch, 比如格式是: [(N_pts, B', 2), (N_pts, B', 2), ...] 和 [(N_pts, H, W), (N_pts, H, W), ...]; num_prompts_per_class==N_pts
+    # SAM 的批次中, 需要输入 [img1, img2, ...], [img1_pt1, img1_pt2, ...], [img1_pt_lab1, img1_pt_lab2, ...], [img1_box, img1_box2, ...]
+    # img1 是 numpy array, shape: (H, W, C);
+    # img1_pt1 是 numpy array, shape: (N_pts, B', 2);    # N_pts 代表 这图像只有 N_pts 组分割, 并且每一组中的 点提示的数量是 B'
+    # img1_pt_lab1 是 numpy array, shape: (N_pts, B'); 
+
+    image_batch = [data['prompts']['image']       for data in batch_data]
+    label_batch = [data['prompts']['target_mask'] for data in batch_data]
+
+    prompt_batch = [data['new_prompts'] for data in batch_data]
+    pt_batch = [data['class_prompts'][1]       for data in prompt_batch]
+
+    from utils import process_list_A
+    point_batch, point_lab_batch, box_batch = process_list_A(pt_batch)   
+
+    # prompts, prompts2 = kwargs['new_prompts'], kwargs['new_prompts2']
+    decoded_mask_batch = [torch.from_numpy(prompt['decoded_mask'][1])[None].cuda().repeat(num_prompts_per_class, 1, 1) for prompt in prompt_batch]
+    # decoded_mask_batch = torch.concat(decoded_mask_batch, dim=0)  # 暂时不用
+
+    # prompts_batch 是一个批处理好的prompts数据结构
+    # decoded_mask_batch 也是批处理好的GT Mask, shape: (B * total_prompts, H, W)
+    # prompts_batch = batch_data['prompts_batch'] 
+    # decoded_mask_batch = batch_data['decoded_mask_batch'].cuda()
+    
+    # 移除 for 循环, 所有操作都在整个批次上执行
+    
+    # 2. 批处理模型推理
+    # 注意: SAM-like 模型通常不支持 set_image 的批处理, 你需要使用模型的 forward 方法
+    # 这可能需要你调整模型包装器
+    # note: 不使用 get_batched_prompt_preds 函数了, 直接用 predictor.predict_batch 来获取 结果
+
+    with torch.enable_grad():
+        model.set_image_batch(image_batch)
+        current_logits_batch, current_scores_batch, _ = model.predict_training_batch(point_batch, point_lab_batch, box_batch=None, multimask_output=True)
+    
+    with torch.no_grad():
+        ref_model.set_image_batch(image_batch)
+        ref_logits_batch, ref_scores_batch, _ = ref_model.predict_training_batch(point_batch, point_lab_batch, box_batch=None, multimask_output=True)
+        # gen_logits = ref_logits_batch.detach()
+
+    # 3. 批处理奖励计算
+    adaptive_pool = nn.AdaptiveAvgPool2d(decoded_mask_batch[0].shape[-2:])
+
+    if args.rw_dispered:
+        rewards1, rewards2 = 0, 0
+        raise ValueError
+    else:
+        # Todo: 这里 为什么要索引 [0], 应该是因为 使用了 multimask_output=True, 但是没有筛选出 score最高的那个; 暂时只选择第一个, 即[0]
+        rewards = [compute_reward_v2(adaptive_pool(current_logits[0]), decoded_mask.float()) for current_logits, decoded_mask in zip(current_logits_batch, decoded_mask_batch)]
+
+    if args.grpo_KL_weight:
+        cls_weights = None
+        raise ValueError
+    
+    if args.is_grpo:
+        loss, kl_div, sample_loss = 0, 0, 0
+        raise ValueError
+    elif args.is_dpo:
+        rewards = [reward.reshape(-1, num_prompts_per_class) for reward in rewards]
+        # compute_reward_v2 接收整个批次的 logits 和 masks
+
+        loss, cls_loss = 0, 0
+        # loss, cls_loss = dpo_loss_segmentation(policy_logits=adaptive_pool(current_logits), ref_logits=adaptive_pool(ref_logits), gt_masks=decoded_mask, 
+        #                                 rewards=rewards, beta=beta, abla_kl=args.abla_kl, abla_dpo=args.abla_dpo, dpo_weight=args.dpo_weight, args=args)
+        losses = [dpo_loss_segmentation(policy_logits=adaptive_pool(i[0]), ref_logits=adaptive_pool(j[0]), gt_masks=k, 
+                                        rewards=p, beta=beta, abla_kl=args.abla_kl, abla_dpo=args.abla_dpo, dpo_weight=args.dpo_weight, args=args) 
+                                        for i, j, k, p in zip(current_logits_batch, ref_logits_batch, decoded_mask_batch, rewards)]
+        loss = sum([i[0] for i in losses]) / len(losses)
+        cls_loss = sum([i[1] for i in losses]) / len(losses)
+
+    else: raise ValueError
+
+    # 绘图
+    if args is not None and args.debug:
+        pass
+
+    if writer is not None:
+        pass
+
+    if loss is not None and torch.isfinite(loss):
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)  # 添加梯度裁剪
+        optimizer.step()
+
+        avg_reward_batch = np.mean([reward.mean().item() for reward in rewards])
+        print(f"DPO Loss: {loss.item():.4f}, Avg Reward: {avg_reward_batch:.4f}")
+
+        return loss.item(), avg_reward_batch
     
     return 0, 0
 
@@ -987,7 +1144,7 @@ def train_with_seg_batch(model, optimizer, scaler, image_batch, label_batch, num
 
         gt_mask = torch.tensor(mask.astype(np.float32)).cuda()
         multimask_len = prd_masks.shape[1]
-        multimask_idx = 0
+        multimask_idx = 0   # Todo: 这个要怎么使用呢？
         prd_mask = torch.sigmoid(prd_masks[:, multimask_idx])# Turn logit map to probability map    # 为什么这是第一个索引
         seg_loss = (-gt_mask * torch.log(prd_mask + 0.00001) - (1 - gt_mask) * torch.log((1 - prd_mask) + 0.00001)).mean() # cross entropy loss
 

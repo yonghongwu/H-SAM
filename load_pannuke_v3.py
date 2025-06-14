@@ -196,14 +196,14 @@ def add_box_noise_ratio(box_prompt, noise_ratio=0.1, image_shape=None):
 
 
 # 使用示例
-def demo_usage(sample, mode='all_nuclei', num_positive_points=1, num_negative_points=0, num_batches=1, all_instance_mode=False):
+def demo_usage(sample, mode='all_nuclei', num_positive_points=1, num_negative_points=0, num_batches=1, all_instance_mode=False, print_info=False):
     # sample = dataset['fold1'][0]
     
     if mode == 'all_nuclei':
         # 示例1: 所有细胞核模式，1个正样本点，0个负样本点
         result1 = process_pannuke_for_sam(sample, mode='all_nuclei', 
                                           num_positive_points=num_positive_points, num_negative_points=num_negative_points, num_batches=num_batches, all_instance_mode=all_instance_mode)
-        if result1:
+        if result1 and print_info:
             print("模式1 - 所有细胞核:")
             print(f"包含的类别: {sample['categories']}")
             # print(f"Point prompts: {result1['point_prompts']}")
@@ -218,7 +218,7 @@ def demo_usage(sample, mode='all_nuclei', num_positive_points=1, num_negative_po
         # 示例2: 特定类别模式，1个正样本点，3个负样本点
         result2 = process_pannuke_for_sam(sample, mode='specific_category', target_category=0,
                                           num_positive_points=num_positive_points, num_negative_points=num_negative_points, all_instance_mode=all_instance_mode)
-        if result2:
+        if result2 and print_info:
             print("\n模式2 - 特定类别 (类别0):")
             print(f"包含的类别: {sample['categories']}")
             # print(f"Point prompts: {result2['point_prompts']}")
@@ -229,6 +229,7 @@ def demo_usage(sample, mode='all_nuclei', num_positive_points=1, num_negative_po
             # print(f"Actual negative points: {result2['num_negative_points']}")
             return result2
     else: raise ValueError("mode must be 'all_nuclei' or 'specific_category'")
+
 
 # 批量处理函数
 def create_sam_dataset(pannuke_dataset, fold_name='fold1', mode='all_nuclei', 

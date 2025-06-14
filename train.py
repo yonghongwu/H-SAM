@@ -16,7 +16,7 @@ from importlib import import_module
 from sam_lora_image_encoder import LoRA_Sam
 from segment_anything import sam_model_registry
 
-from trainer import trainer_synapse, trainer_pannuke
+from trainer import trainer_synapse, trainer_pannuke, trainer_pannuke_batch
 from icecream import ic
 from sende import let_me_know
 
@@ -45,7 +45,7 @@ parser.add_argument('--max_iterations', type=int,
                     default=30000, help='maximum epoch number to train')
 parser.add_argument('--max_epochs', type=int,
                     default=300, help='maximum epoch number to train')
-parser.add_argument('--batch_size', type=int,
+parser.add_argument('--batch_size', '-b', type=int,
                     default=24, help='batch_size per gpu')
 parser.add_argument('--n_gpu', type=int, default=2, help='total gpu')
 parser.add_argument('--deterministic', type=int, default=1,
@@ -299,6 +299,6 @@ if __name__ == "__main__":
     with open(config_file, 'w') as f:
         f.writelines(config_items)
 
-    trainer = {'Synapse': trainer_synapse, 'PanNuke': trainer_pannuke}
+    trainer = {'Synapse': trainer_synapse, 'PanNuke': trainer_pannuke_batch}
     trainer[dataset_name](args, net, snapshot_path, multimask_output, low_res)
     let_me_know(f'Finish', 'SAM-Exps')
