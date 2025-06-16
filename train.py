@@ -111,6 +111,8 @@ parser.add_argument('--desc', type=str, default='none', help='实验说明')
 
 parser.add_argument('--onlybest_in_multimask_output', action='store_true', help='If activated, only the best mask will be used in multimask_output')
 
+parser.add_argument('--pred_score_task', action='store_true', help='是否要对 iou 的预测进行训练')
+
 parser.add_argument('--semi', action='store_true', help='是否开启半监督任务')
 parser.add_argument('--semi_ratio', type=float, default=0.1, help='半监督任务中有标注数据的比例')
 parser.add_argument('--use_unet', action='store_true', help='是否使用 unet 来支持半监督或者其他算法')
@@ -125,6 +127,8 @@ if args.debug:
         args.root_path = '/database/wuyonghuang/hsam_code/data/multi-organ-CT/train_npz_512/'
 
         args.dataset = 'PanNuke'
+
+        args.pred_score_task = True
 
         args.pos_point_num = (1, 5)
         args.neg_point_num = (0, 5)

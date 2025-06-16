@@ -845,7 +845,7 @@ def trainer_pannuke_batch(args, model, snapshot_path, multimask_output, low_res)
                     # 对于不同的 prompt 导致的不同的预测结果, 计算出奖励, 然后使用 GRPO 进行优化: 奖励是由其他模型提供的, 那么怎么对本模型进行优化呢？
                     # 奖励的方式: 训练一个 prompt奖励回归器、基于 iou_prediction、基于预测结果跟 ground truth 的 iou、基于更大的模型
                     if args.is_grpo or args.is_dpo: # Todo: 在DPO中加入半监督的数据处理
-                        loss, _ = train_with_po_batched(model, optimizer, scaler, collect_batch, num_prompts_per_class=num_prompts_per_class,
+                        loss, score_loss, _ = train_with_po_batched(model, optimizer, scaler, collect_batch, num_prompts_per_class=num_prompts_per_class,
                                                         beta=args.kl_beta, iteration=iter_num, writer=writer, args=args, **kwargs)
                     elif args.dev:
                         loss, _ = None  # train_with_seg_batch(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=num_prompts_per_class, 
@@ -871,6 +871,7 @@ def trainer_pannuke_batch(args, model, snapshot_path, multimask_output, low_res)
             iter_num = iter_num + 1
             writer.add_scalar('info/lr', lr_, iter_num)
             writer.add_scalar('info/total_loss', loss, iter_num)
+            writer.add_scalar('info/score_loss', score_loss, iter_num)
             if args.model == 'hsam':
                 writer.add_scalar('info/loss_ce1', loss_ce1, iter_num)
                 writer.add_scalar('info/loss_dice1', loss_dice1, iter_num)
@@ -885,7 +886,7 @@ def trainer_pannuke_batch(args, model, snapshot_path, multimask_output, low_res)
             if args.model == 'hsam':
                 tqdm.write('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f, loss_ce2: %f, loss_dice2: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item(), loss_ce2.item(), loss_dice2.item()))
             else:
-                tqdm.write('iteration %d : loss : %f' % (iter_num, loss))
+                tqdm.write('iteration %d : loss : %f : score_loss : %f' % (iter_num, loss, score_loss))
             
             if args.debug and i_batch == 0:
                 break

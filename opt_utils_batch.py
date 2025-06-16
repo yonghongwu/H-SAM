@@ -11,6 +11,7 @@ from einops import rearrange
 from collections import defaultdict
 from utils import get_decoded_mask
 from gen_prompt import generate_prompts_from_semantic_mask, get_prompt_preds, concatenate_masks_and_scores_v2, plot_results
+from utils import process_list_A
 
 
 def vanilla_opt(model, optimizer, scaler, image_batch, label_batch, num_prompts_per_class=3, args=None, only_train_unet=False, **kwargs):
@@ -200,6 +201,20 @@ def create_reference_model(model):
         param.requires_grad = False
     ref_model.model.eval()
     return ref_model
+
+
+def update_reference_model_with_momentum(ref_model, actor_model, momentum=0.999):
+    """
+    使用动量更新reference model
+    
+    Args:
+        ref_model: 参考模型
+        actor_model: 当前训练的actor模型
+        momentum: 动量系数，越接近1更新越慢
+    """
+    with torch.no_grad():
+        for ref_param, actor_param in zip(ref_model.model.parameters(), actor_model.model.parameters()):
+            ref_param.data = momentum * ref_param.data + (1 - momentum) * actor_param.data
 
 
 # 每3个元素为一组进行标准化
@@ -779,16 +794,21 @@ def none_func(*args, **kwargs):
 
 def train_with_po_batched(model, optimizer, scaler, batch_data, num_prompts_per_class=3, beta=0.05, iteration=0, writer=None, args=None, **kwargs):
     # 0. 初始化参考模型 (逻辑不变)
+    # if not hasattr(train_with_po_batched, 'ref_model'):
+    #     train_with_po_batched.ref_model = create_reference_model(model)
+    # ref_model = train_with_po_batched.ref_model
+
+    # 变成动量更新 refer model
     if not hasattr(train_with_po_batched, 'ref_model'):
         train_with_po_batched.ref_model = create_reference_model(model)
+        # 初始化动量系数和更新频率
+        train_with_po_batched.momentum = 0.999  # 可以根据需要调整
+        train_with_po_batched.update_freq = 10   # 每10个batch更新一次reference model
+        train_with_po_batched.step_count = 0
     ref_model = train_with_po_batched.ref_model
 
     # 1. 从批次数据中获取张量 (由collate_fn准备好)
-    # image_batch = batch_data['image_batch'].cuda()  # (B, C, H, W)
-    # label_batch = batch_data['label_batch'].cuda()  # (B, H, W)
-
-
-    # note: 传入一个字典, 处理出 prompts_batch 和 decoded_mask_batch, 比如格式是: [(N_pts, B', 2), (N_pts, B', 2), ...] 和 [(N_pts, H, W), (N_pts, H, W), ...]; num_prompts_per_class==N_pts
+    # 传入一个字典, 处理出 prompts_batch 和 decoded_mask_batch, 比如格式是: [(N_pts, B', 2), (N_pts, B', 2), ...] 和 [(N_pts, H, W), (N_pts, H, W), ...]; num_prompts_per_class==N_pts
     # SAM 的批次中, 需要输入 [img1, img2, ...], [img1_pt1, img1_pt2, ...], [img1_pt_lab1, img1_pt_lab2, ...], [img1_box, img1_box2, ...]
     # img1 是 numpy array, shape: (H, W, C);
     # img1_pt1 是 numpy array, shape: (N_pts, B', 2);    # N_pts 代表 这图像只有 N_pts 组分割, 并且每一组中的 点提示的数量是 B'
@@ -797,35 +817,27 @@ def train_with_po_batched(model, optimizer, scaler, batch_data, num_prompts_per_
     image_batch = [data['prompts']['image']       for data in batch_data]
     label_batch = [data['prompts']['target_mask'] for data in batch_data]
 
-    prompt_batch = [data['new_prompts'] for data in batch_data]
+    prompt_batch = [data['new_prompts']        for data in batch_data]
     pt_batch = [data['class_prompts'][1]       for data in prompt_batch]
 
-    from utils import process_list_A
-    point_batch, point_lab_batch, box_batch = process_list_A(pt_batch)   
+    prompt_batch2 = [data['new_prompts2']      for data in batch_data]
+    pt_batch2 = [data['class_prompts'][1]       for data in prompt_batch2]
 
-    # prompts, prompts2 = kwargs['new_prompts'], kwargs['new_prompts2']
+    point_batch, point_lab_batch, box_batch = process_list_A(pt_batch)
+    point_batch2, point_lab_batch2, box_batch2 = process_list_A(pt_batch2)
+
     decoded_mask_batch = [torch.from_numpy(prompt['decoded_mask'][1])[None].cuda().repeat(num_prompts_per_class, 1, 1) for prompt in prompt_batch]
     # decoded_mask_batch = torch.concat(decoded_mask_batch, dim=0)  # 暂时不用
 
-    # prompts_batch 是一个批处理好的prompts数据结构
-    # decoded_mask_batch 也是批处理好的GT Mask, shape: (B * total_prompts, H, W)
-    # prompts_batch = batch_data['prompts_batch'] 
-    # decoded_mask_batch = batch_data['decoded_mask_batch'].cuda()
-    
-    # 移除 for 循环, 所有操作都在整个批次上执行
-    
     # 2. 批处理模型推理
-    # 注意: SAM-like 模型通常不支持 set_image 的批处理, 你需要使用模型的 forward 方法
-    # 这可能需要你调整模型包装器
-    # note: 不使用 get_batched_prompt_preds 函数了, 直接用 predictor.predict_batch 来获取 结果
-
+    # 不使用 get_batched_prompt_preds 函数了, 直接用 predictor.predict_batch 来获取 结果
     with torch.enable_grad():
         model.set_image_batch(image_batch)
         current_logits_batch, current_scores_batch, _ = model.predict_training_batch(point_batch, point_lab_batch, box_batch=None, multimask_output=True)
     
     with torch.no_grad():
         ref_model.set_image_batch(image_batch)
-        ref_logits_batch, ref_scores_batch, _ = ref_model.predict_training_batch(point_batch, point_lab_batch, box_batch=None, multimask_output=True)
+        ref_logits_batch, ref_scores_batch, _ = ref_model.predict_training_batch(point_batch2, point_lab_batch2, box_batch=None, multimask_output=True)
         # gen_logits = ref_logits_batch.detach()
 
     # 3. 批处理奖励计算
@@ -835,8 +847,20 @@ def train_with_po_batched(model, optimizer, scaler, batch_data, num_prompts_per_
         rewards1, rewards2 = 0, 0
         raise ValueError
     else:
-        # Todo: 这里 为什么要索引 [0], 应该是因为 使用了 multimask_output=True, 但是没有筛选出 score最高的那个; 暂时只选择第一个, 即[0]
-        rewards = [compute_reward_v2(adaptive_pool(current_logits[0]), decoded_mask.float()) for current_logits, decoded_mask in zip(current_logits_batch, decoded_mask_batch)]
+        iou_batch = [compute_reward_v2(adaptive_pool(current_logits[idx]), decoded_mask.float(), metric='iou') 
+                       for current_logits, decoded_mask in zip(current_logits_batch, decoded_mask_batch) 
+                       for idx in range(current_logits.shape[0])]
+        best_scores_batch =  torch.stack(iou_batch).reshape(len(image_batch), num_prompts_per_class, 3).argmax(dim=2)   # 3是multitask-output的数量
+        # 加入对 score 的预测
+        if args.pred_score_task:
+            score_pred_loss = F.mse_loss(input=torch.concat(current_scores_batch), target=torch.stack(iou_batch))
+        else: score_pred_loss = torch.tensor(0)
+
+        # 选择multimask_output 中最佳的那个
+        rewards = [compute_reward_v2(adaptive_pool(current_logits[torch.arange(num_prompts_per_class).cuda(), best_score_idx]), decoded_mask.float(), metric='iou') 
+                   for batch_idx, (current_logits, decoded_mask, best_score_idx) in enumerate(zip(current_logits_batch, decoded_mask_batch, best_scores_batch))]
+        # 验证 iou_batch 和 rewards 是不是一致
+        assert torch.sum(torch.concat(rewards).reshape(-1, num_prompts_per_class) - torch.stack([torch.max(i) for i in iou_batch]).reshape(-1, 3)) == 0
 
     if args.grpo_KL_weight:
         cls_weights = None
@@ -869,14 +893,20 @@ def train_with_po_batched(model, optimizer, scaler, batch_data, num_prompts_per_
 
     if loss is not None and torch.isfinite(loss):
         optimizer.zero_grad()
-        scaler.scale(loss).backward()
+        if args.pred_score_task:
+            scaler.scale(loss + score_pred_loss).backward()
+        else:
+            scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)  # 添加梯度裁剪
         optimizer.step()
 
         avg_reward_batch = np.mean([reward.mean().item() for reward in rewards])
         print(f"DPO Loss: {loss.item():.4f}, Avg Reward: {avg_reward_batch:.4f}")
 
-        return loss.item(), avg_reward_batch
+        if iteration % train_with_po_batched.update_freq == 0:
+            update_reference_model_with_momentum(ref_model, model, momentum=train_with_po_batched.momentum)
+
+        return loss.item(), score_pred_loss.item(), avg_reward_batch
     
     return 0, 0
 

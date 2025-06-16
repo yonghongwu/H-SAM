@@ -2,7 +2,7 @@ cd /database/wuyonghuang/hsam_code
 source /database/wuyonghuang/hsam_code/uv_hsam/bin/activate
 
 
-for dpo_weight in 0.05 0.01 0.001  # 0.0001 0 0.1    # 或者简写为 seq start end，如果 increment 为 1
+for dpo_weight in 0.0001 0 0.1 # 0.05 0.01 0.001  #   # 或者简写为 seq start end，如果 increment 为 1
 do
   echo "当前数字: $dpo_weight"
   current_time=$(date +"%Y-%m-%d-%H:%M:%S")
