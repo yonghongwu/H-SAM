@@ -57,6 +57,9 @@ class MaskDecoder(nn.Module):
         self.num_mask_tokens = num_multimask_outputs + 1
         self.mask_tokens = nn.Embedding(self.num_mask_tokens, transformer_dim)
         
+        # note: 增加一个 task-spec 的 learning token
+        self.task_spec_token = nn.Parameter(torch.randn(1, 1, transformer_dim))
+
         self.pred_obj_scores = pred_obj_scores
         if self.pred_obj_scores:
             self.obj_score_token = nn.Embedding(1, transformer_dim)
@@ -192,6 +195,8 @@ class MaskDecoder(nn.Module):
                 [self.iou_token.weight, self.mask_tokens.weight], dim=0
             )
         
+        sparse_prompt_embeddings = (sparse_prompt_embeddings + self.task_spec_token.cuda()) # TODO: 测试一下这个的效果
+
         output_tokens = output_tokens.unsqueeze(0).expand(
             sparse_prompt_embeddings.size(0), -1, -1
         )
