@@ -12,7 +12,10 @@ LICENSE
 testset/test_vol_h5
 lists/*
 
-/sam2*
+*.egg-info
+/sam2-main/.github
+*.pth
+*.pt
 
 *.jpg
 *.png
@@ -23,3 +26,9 @@ raw.npy
 /*.ipynb
 
 /data
+
+/python*
+
+/uv*
+
+*.tar.gz
